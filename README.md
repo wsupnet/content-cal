@@ -9,6 +9,10 @@ Data is stored in a single **SQLite** database file (`calendar.db`) on your NAS.
 (Older installs that used a `calendar.json` file are imported automatically on
 first start and renamed to `calendar.json.migrated`.)
 
+[![ContentCal demo — click to watch the full 90-second tour](docs/contentcal-demo-preview.gif)](docs/contentcal-demo.mp4)
+
+▶ **[Watch the 90-second demo](docs/contentcal-demo.mp4)** — sign in, add a video, drag it across the board, comment, and switch views.
+
 📚 **Full documentation lives in [`docs/`](docs/):**
 [Overview](docs/OVERVIEW.md) · [User Guide](docs/USER_GUIDE.md) · [Developer Guide](docs/DEVELOPER_GUIDE.md)
 

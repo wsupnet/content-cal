@@ -2,6 +2,8 @@
 
 A friendly, no-jargon guide to planning your YouTube videos with ContentCal. If you can use a calendar app, you can use this.
 
+> 🎬 **New here?** [Watch the 90-second demo](contentcal-demo.mp4) first. It walks through the same steps as sections 2–6 below.
+
 ---
 
 ## Table of contents

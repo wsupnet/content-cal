@@ -12,6 +12,14 @@ Plan, track, and ship videos across up to six channels — from raw idea to publ
 
 ![Month view](screenshots/02_month.png)
 
+### ▶ See it in action
+
+<video src="contentcal-demo.mp4" controls muted playsinline width="100%">
+  <a href="contentcal-demo.mp4">Watch the 90-second demo (MP4)</a>
+</video>
+
+A 90-second tour with captions: signing in, the goal tracker and pipeline stats, adding a video, dragging it across the Kanban board, commenting, the List / Backlog / Year views, and dark mode. If the player doesn't show above, **[open the video directly](contentcal-demo.mp4)**.
+
 ---
 
 ## What it is
