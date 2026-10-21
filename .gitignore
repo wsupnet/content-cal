@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets and local config
+.env
+.env.*
+
+# App data — your calendar lives here, not in git
+*.db
+*.sqlite
+*.sqlite3
+
+# macOS
+.DS_Store
+
+# Syncthing
+.stfolder
+
+# Old migrated data
+*.migrated
+
+# Runtime data (adjust after checking what's inside)
+data/
+
+# Claude Code (personal settings)
+.claude/

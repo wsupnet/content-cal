@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Pre-push hook: run the backend regression suite before letting a push out.
+# Configured via `make install-hooks`, which sets core.hooksPath=.githooks
+# so this file is versioned in the repo and gets restored on fresh clones.
+#
+# Bypass (rare, e.g. WIP branch): `git push --no-verify`
+
+set -e
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Fail clearly if dev deps are missing, instead of letting pytest produce
+# a less-useful ImportError further down.
+# Pick whichever Python interpreter is on PATH. macOS provides `python3` but
+# not `python`; Linux distros / virtualenvs commonly have both.
+if command -v python3 >/dev/null 2>&1; then
+  PY=python3
+elif command -v python >/dev/null 2>&1; then
+  PY=python
+else
+  echo "✗ No python interpreter found on PATH."
+  exit 1
+fi
+
+if ! $PY -c "import pytest" >/dev/null 2>&1; then
+  echo "✗ pytest is not installed for $PY. Run 'make setup' once, then push again."
+  exit 1
+fi
+
+echo "→ Running backend regression suite before push…"
+make test
+echo "✓ Tests passed. Pushing."

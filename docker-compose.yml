@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  contentcal:
+    build: ./backend
+    container_name: contentcal
+    restart: unless-stopped
+    ports:
+      - "8765:8000"          # Change 8765 to any port you want
+    volumes:
+      - ./frontend:/frontend:ro          # Serves the HTML frontend
+      - ./backend/main.py:/app/main.py:ro # to prevent the need to rebuild the container
+      - /volume1/docker/contentcal:/data  # ← CHANGE THIS to your NAS path
+    environment:
+      - DATA_FILE=/data/calendar.json
+
+networks:
+  default:
+    name: contentcal_net
