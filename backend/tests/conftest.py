@@ -1,8 +1,8 @@
 """Shared fixtures and helpers for the ContentCal regression test suite.
 
-Critical: this module sets DATA_DIR / DB_FILE / SESSION_SECRET env vars and
+Critical: this module sets DATA_DIR / SESSION_SECRET env vars and
 monkey-patches `fastapi.staticfiles.StaticFiles` BEFORE importing the app, so
-that (a) the production sqlite DB at /data/calendar.db is never touched, and
+that (a) the production sqlite DB at /app/data/calendar.db is never touched, and
 (b) the hardcoded `directory="/frontend"` mount in main.py doesn't blow up on
 the test runner's machine.
 """
@@ -24,7 +24,7 @@ _FRONTEND_STUB.mkdir(parents=True, exist_ok=True)
 (_FRONTEND_STUB / "index.html").write_text("<!-- test stub -->")
 
 os.environ["DATA_DIR"] = str(_DATA_DIR)
-os.environ["DB_FILE"] = str(_DATA_DIR / "test.db")
+os.environ.pop("REQUIRE_EXISTING_DB", None)
 os.environ["SESSION_SECRET"] = "test-secret-do-not-use-anywhere-real"
 
 # Patch StaticFiles so the hardcoded "/frontend" directory in main.py doesn't

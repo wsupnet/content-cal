@@ -79,11 +79,26 @@ def _validate_text(s: Optional[str], *, field: str, max_len: int = MAX_TEXT_LEN)
     return s
 
 # ── Paths / config ───────────────────────────────────────────────
-DATA_DIR = pathlib.Path(os.getenv("DATA_DIR", "/data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_FILE = pathlib.Path(os.getenv("DB_FILE", str(DATA_DIR / "calendar.db")))
-JSON_FILE = pathlib.Path(os.getenv("DATA_FILE", str(DATA_DIR / "calendar.json")))
+# Every data path derives from DATA_DIR — no other path settings.
+DATA_DIR = pathlib.Path(os.getenv("DATA_DIR", "/app/data")).resolve()
+DB_FILE = DATA_DIR / "calendar.db"
+JSON_FILE = DATA_DIR / "calendar.json"
 SECRET_FILE = DATA_DIR / ".session_secret"
+
+# REQUIRE_EXISTING_DB=1 makes a missing database fatal instead of silently
+# starting a fresh empty one (e.g. when the data volume isn't mounted where
+# expected). Leave it unset for a brand-new install's first run.
+REQUIRE_EXISTING_DB = os.getenv("REQUIRE_EXISTING_DB", "").strip().lower() in ("1", "true", "yes")
+if REQUIRE_EXISTING_DB and not DB_FILE.is_file():
+    raise RuntimeError(
+        f"[fatal] REQUIRE_EXISTING_DB is set but no database exists at {DB_FILE}. "
+        "Check that the data volume is mounted at DATA_DIR. Refusing to create an empty one."
+    )
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+print(
+    f"[init] DATA_DIR={DATA_DIR} DB_FILE={DB_FILE} "
+    + (f"(exists, {DB_FILE.stat().st_size} bytes)" if DB_FILE.is_file() else "(missing — a new empty database will be created)")
+)
 
 # Session secret: read from env, or persist a generated one in the data dir so
 # session cookies survive container restarts (only regenerates if the file is

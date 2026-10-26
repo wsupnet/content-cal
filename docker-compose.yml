@@ -10,9 +10,12 @@ services:
     volumes:
       - ./frontend:/frontend:ro          # Serves the HTML frontend
       - ./backend/main.py:/app/main.py:ro # to prevent the need to rebuild the container
-      - /volume1/docker/contentcal:/data  # ← CHANGE THIS to your NAS path
+      - ./data:/app/data                  # calendar.db lives here (gitignored, never in the repo)
     environment:
-      - DATA_FILE=/data/calendar.json
+      - DATA_DIR=/app/data
+      # Refuse to start if ./data/calendar.db is missing instead of creating an
+      # empty one. Comment out for a brand-new install's very first run.
+      - REQUIRE_EXISTING_DB=1
 
 networks:
   default:

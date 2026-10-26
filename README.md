@@ -34,18 +34,20 @@ first start and renamed to `calendar.json.migrated`.)
 
 ## Quick Start
 
-### 1. Set your data path
+### 1. Data folder
 
-Edit `docker-compose.yml` and update this line to point to a folder on your NAS:
+Your data lives in `./data` next to `docker-compose.yml` (mounted at
+`/app/data`, gitignored). Clone the repo, then create it:
 
-```yaml
-- /your/nas/path/contentcal:/data
+```bash
+mkdir data
 ```
 
-Example for UGREEN NAS:
-```yaml
-- /mnt/data/appdata/contentcal:/data
-```
+Moving an existing install? Copy your `calendar.db` (and optionally
+`.session_secret`) into `./data` **before** the first start. The compose file
+sets `REQUIRE_EXISTING_DB=1`, so the app refuses to start rather than create an
+empty database. For a brand-new install, comment that line out for the first
+run only.
 
 ### 2. Build and run
 

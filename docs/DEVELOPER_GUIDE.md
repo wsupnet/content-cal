@@ -55,12 +55,13 @@ contentcalv3/
 │   └── tests/             # ~80 pytest regression tests
 ├── frontend/
 │   └── index.html         # The entire frontend (HTML + CSS + JS)
-├── docker-compose.yml     # Maps :8765 -> :8000, mounts /data volume
+├── docker-compose.yml     # Maps :8765 -> :8000, mounts ./data at /app/data
 ├── Makefile               # setup / test / install-hooks
-└── README.md
+├── README.md
+└── data/                  # Runtime data (gitignored)
 ```
 
-> Data files (`calendar.db`, the migrated legacy `calendar.json`) live in the mounted `/data` volume at runtime, **not** in the repo.
+> Data files (`calendar.db`, `.session_secret`, the migrated legacy `calendar.json`) live in `./data` (mounted at `/app/data`) at runtime, **not** in the repo.
 
 ---
 
@@ -69,8 +70,8 @@ contentcalv3/
 ### Docker (production / NAS)
 
 ```bash
-# Edit docker-compose.yml: point the data volume at your NAS path
-#   - /your/nas/path/contentcal:/data
+# ./data (next to docker-compose.yml) is mounted at /app/data
+mkdir -p data
 docker compose up -d --build
 # App: http://<host>:8765   (host 8765 -> container 8000)
 ```
@@ -79,7 +80,7 @@ The compose file bind-mounts `./frontend` to `/frontend` (read-only) and `./back
 
 ### Local development
 
-`main.py` mounts the frontend from the absolute path `/frontend` (see the very last line) and reads/writes `/data` by default. The simplest reliable dev loop is therefore Docker, but you can run bare-metal by overriding the env vars and adjusting the static mount:
+`main.py` mounts the frontend from the absolute path `/frontend` (see the very last line) and reads/writes `/app/data` by default. The simplest reliable dev loop is therefore Docker, but you can run bare-metal by overriding the env vars and adjusting the static mount:
 
 ```bash
 cd backend
@@ -115,7 +116,7 @@ On an empty database the app seeds three default channels and waits. The first b
 └───────────────┬──────────────────────────────┘
                 │ SQLModel / SQLAlchemy
 ┌───────────────▼──────────────────────────────┐
-│  SQLite  (/data/calendar.db)                  │
+│  SQLite  (/app/data/calendar.db)              │
 └──────────────────────────────────────────────┘
 ```
 
@@ -177,7 +178,7 @@ Every domain row carries a `workspace_id`. The golden rule:
 
 - **Passwords** — bcrypt via the `bcrypt` package. Inputs are truncated to bcrypt's 72-byte limit (`hash_password` / `verify_password`) so long passphrases don't raise. Minimum length is 8 chars.
 - **Sessions** — a signed (not encrypted) token via `itsdangerous.URLSafeSerializer`, carrying `{uid, wsid}`. Stored in the `contentcal_session` cookie: `httponly`, `samesite=lax`, `max_age=30 days`, `secure=False` (terminate TLS at a reverse proxy in front).
-- **Session secret** — from `SESSION_SECRET` env, else a generated secret persisted to `/data/.session_secret` (chmod 600) so cookies survive restarts. **Multi-replica deployments must set `SESSION_SECRET`** or sessions will randomly 401 as requests round-robin; the app warns about this on startup.
+- **Session secret** — from `SESSION_SECRET` env, else a generated secret persisted to `/app/data/.session_secret` (chmod 600) so cookies survive restarts. **Multi-replica deployments must set `SESSION_SECRET`** or sessions will randomly 401 as requests round-robin; the app warns about this on startup.
 
 Switching the active workspace (`PUT /api/me/active-workspace`) re-issues the cookie and persists the choice as the user's new `default_workspace_id`.
 
@@ -376,9 +377,8 @@ After `make install-hooks`, every `git push` runs the suite first and blocks on 
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `DATA_DIR` | `/data` | Base directory for the DB and secret |
-| `DB_FILE` | `$DATA_DIR/calendar.db` | SQLite path |
-| `DATA_FILE` | `$DATA_DIR/calendar.json` | Legacy JSON to import on first run |
+| `DATA_DIR` | `/app/data` | The only data-path setting: holds `calendar.db`, `.session_secret`, and legacy `calendar.json` (imported on first run). Logged on startup. |
+| `REQUIRE_EXISTING_DB` | _(unset)_ | `1` = refuse to start if `$DATA_DIR/calendar.db` is missing instead of creating an empty one. Set in `docker-compose.yml`; comment out for a brand-new install's first run. |
 | `SESSION_SECRET` | on-disk generated | **Set this for multi-replica deploys** |
 | `ALLOWED_ORIGINS` | _(none)_ | Comma-separated CORS origins; never `*` (cookies need credentialed CORS) |
 

@@ -62,8 +62,9 @@ It's built to be **self-hosted**: one Docker container, one SQLite database file
 ## Quick start
 
 ```bash
-# 1. Point the data volume at a folder on your NAS (edit docker-compose.yml)
-#    - /your/nas/path/contentcal:/data
+# 1. Create the data folder (mounted at /app/data; put calendar.db here
+#    if you're moving an existing install)
+mkdir data
 
 # 2. Build and run
 docker compose up -d --build
