@@ -62,9 +62,11 @@ It's built to be **self-hosted**: one Docker container, one SQLite database file
 ## Quick start
 
 ```bash
-# 1. Create the data folder (mounted at /app/data; put calendar.db here
-#    if you're moving an existing install)
-mkdir data
+# 1. Point APPDATA at your data root (.env is never committed) and create
+#    the data folder (mounted at /app/data; put calendar.db here if you're
+#    moving an existing install)
+echo "APPDATA=/volume1/docker/appdata" > .env
+mkdir -p /volume1/docker/appdata/contentcal
 
 # 2. Build and run
 docker compose up -d --build

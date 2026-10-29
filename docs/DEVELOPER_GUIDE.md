@@ -55,13 +55,13 @@ contentcalv3/
 │   └── tests/             # ~80 pytest regression tests
 ├── frontend/
 │   └── index.html         # The entire frontend (HTML + CSS + JS)
-├── docker-compose.yml     # Maps :8765 -> :8000, mounts ./data at /app/data
+├── docker-compose.yml     # Maps :8765 -> :8000, mounts $APPDATA/contentcal at /app/data
+├── .env.example           # Template for .env (APPDATA); .env itself is gitignored
 ├── Makefile               # setup / test / install-hooks
-├── README.md
-└── data/                  # Runtime data (gitignored)
+└── README.md
 ```
 
-> Data files (`calendar.db`, `.session_secret`, the migrated legacy `calendar.json`) live in `./data` (mounted at `/app/data`) at runtime, **not** in the repo.
+> Data files (`calendar.db`, `.session_secret`, the migrated legacy `calendar.json`) live in `$APPDATA/contentcal` (mounted at `/app/data`) at runtime, **outside** the repo. On the NAS that is `/volume1/docker/appdata/contentcal`; on a Mac, `./dev-data/contentcal` (gitignored).
 
 ---
 
@@ -70,11 +70,14 @@ contentcalv3/
 ### Docker (production / NAS)
 
 ```bash
-# ./data (next to docker-compose.yml) is mounted at /app/data
-mkdir -p data
+# $APPDATA/contentcal is mounted at /app/data; APPDATA comes from .env
+cp .env.example .env            # NAS: set APPDATA=/volume1/docker/appdata
+mkdir -p dev-data/contentcal    # NAS: /volume1/docker/appdata/contentcal
 docker compose up -d --build
 # App: http://<host>:8765   (host 8765 -> container 8000)
 ```
+
+Deploying an update on the NAS is `git pull` then `docker compose up -d --build` from `/volume1/docker/apps/contentcal`.
 
 The compose file bind-mounts `./frontend` to `/frontend` (read-only) and `./backend/main.py` to `/app/main.py`, so you can edit `main.py` and restart the container without rebuilding the image.
 
@@ -378,6 +381,7 @@ After `make install-hooks`, every `git push` runs the suite first and blocks on 
 | Env var | Default | Purpose |
 |---|---|---|
 | `DATA_DIR` | `/app/data` | The only data-path setting: holds `calendar.db`, `.session_secret`, and legacy `calendar.json` (imported on first run). Logged on startup. |
+| `APPDATA` (compose only, from `.env`) | _(required)_ | Host folder whose `contentcal/` subfolder is mounted at `/app/data`. `docker compose` errors out if unset. |
 | `REQUIRE_EXISTING_DB` | _(unset)_ | `1` = refuse to start if `$DATA_DIR/calendar.db` is missing instead of creating an empty one. Set in `docker-compose.yml`; comment out for a brand-new install's first run. |
 | `SESSION_SECRET` | on-disk generated | **Set this for multi-replica deploys** |
 | `ALLOWED_ORIGINS` | _(none)_ | Comma-separated CORS origins; never `*` (cookies need credentialed CORS) |

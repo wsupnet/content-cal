@@ -36,16 +36,29 @@ first start and renamed to `calendar.json.migrated`.)
 
 ### 1. Data folder
 
-Your data lives in `./data` next to `docker-compose.yml` (mounted at
-`/app/data`, gitignored). Clone the repo, then create it:
+Your data lives **outside the repo**, in `$APPDATA/contentcal` (mounted at
+`/app/data`). `APPDATA` is set in a `.env` file next to `docker-compose.yml`
+that is never committed; `docker compose` refuses to run if it is missing.
+
+On the NAS (repo at `/volume1/docker/apps/contentcal`):
 
 ```bash
-mkdir data
+cd /volume1/docker/apps/contentcal
+echo "APPDATA=/volume1/docker/appdata" > .env
+mkdir -p /volume1/docker/appdata/contentcal
 ```
 
-Moving an existing install? Copy your `calendar.db` (and optionally
-`.session_secret`) into `./data` **before** the first start. The compose file
-sets `REQUIRE_EXISTING_DB=1`, so the app refuses to start rather than create an
+On a Mac for local testing, copy the example, which points at the gitignored
+`./dev-data` folder:
+
+```bash
+cp .env.example .env
+mkdir -p dev-data/contentcal
+```
+
+Moving an existing install? Copy your `calendar.db` and `.session_secret` into
+`$APPDATA/contentcal` **before** the first start. The compose file sets
+`REQUIRE_EXISTING_DB=1`, so the app refuses to start rather than create an
 empty database. For a brand-new install, comment that line out for the first
 run only.
 
@@ -71,21 +84,36 @@ account; invite teammates from **Workspace settings**.
 
 ---
 
-## Portainer Setup
+## Dockhand Setup
 
-1. In Portainer → **Stacks** → **Add Stack**
-2. Upload or paste the contents of `docker-compose.yml`
-3. Update the volume path
+The stack is deployed from the repo with `docker compose`, so Dockhand only
+needs to manage the existing compose project:
+
+1. Clone the repo to `/volume1/docker/apps/contentcal` and create its `.env`
+   (see [Data folder](#1-data-folder))
+2. In Dockhand, add the stack from that folder's `docker-compose.yml` (the
+   project name is `contentcal`)
+3. Make sure `APPDATA=/volume1/docker/appdata` is set, either from the `.env`
+   next to the compose file or as a stack environment variable in Dockhand
 4. Deploy
+
+Point Dockhand at the compose file inside the repo rather than pasting its
+contents: the `./frontend` and `./backend/main.py` mounts are relative to the
+compose file's folder and won't resolve from a pasted copy.
 
 ---
 
 ## Updating
 
+On the NAS:
+
 ```bash
-docker compose pull
+cd /volume1/docker/apps/contentcal
+git pull
 docker compose up -d --build
 ```
+
+Your data in `$APPDATA/contentcal` is untouched by `git pull`.
 
 ---
 
@@ -94,7 +122,7 @@ docker compose up -d --build
 Your entire calendar — every workspace, channel, video, comment, and account —
 lives in one SQLite file:
 ```
-/your/nas/path/contentcal/calendar.db
+/volume1/docker/appdata/contentcal/calendar.db
 ```
 
 Back this up with your normal NAS backup routine (rsync, Hyper Backup, etc.).

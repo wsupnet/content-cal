@@ -1,4 +1,4 @@
-version: "3.9"
+name: contentcal
 
 services:
   contentcal:
@@ -10,11 +10,13 @@ services:
     volumes:
       - ./frontend:/frontend:ro          # Serves the HTML frontend
       - ./backend/main.py:/app/main.py:ro # to prevent the need to rebuild the container
-      - ./data:/app/data                  # calendar.db lives here (gitignored, never in the repo)
+      # App data lives OUTSIDE the repo. APPDATA comes from .env (not in Git);
+      # see .env.example. calendar.db and .session_secret live in this folder.
+      - ${APPDATA:?APPDATA is not set}/contentcal:/app/data
     environment:
       - DATA_DIR=/app/data
-      # Refuse to start if ./data/calendar.db is missing instead of creating an
-      # empty one. Comment out for a brand-new install's very first run.
+      # Refuse to start if $APPDATA/contentcal/calendar.db is missing instead of
+      # creating an empty one. Comment out for a brand-new install's very first run.
       - REQUIRE_EXISTING_DB=1
 
 networks:
