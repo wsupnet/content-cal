@@ -52,7 +52,7 @@ contentcalv3/
 │   ├── Dockerfile         # python:3.12-slim + uvicorn
 │   ├── requirements.txt   # fastapi, uvicorn, pydantic, sqlmodel, bcrypt, itsdangerous
 │   ├── requirements-dev.txt
-│   └── tests/             # ~80 pytest regression tests
+│   └── tests/             # ~110 pytest regression tests
 ├── frontend/
 │   └── index.html         # The entire frontend (HTML + CSS + JS)
 ├── docker-compose.yml     # Maps :8765 -> :8000, mounts $APPDATA/contentcal at /app/data
@@ -96,7 +96,7 @@ DATA_DIR=./_data uvicorn main:app --reload --port 8000
 
 ### First run
 
-On an empty database the app seeds three default channels and waits. The first browser to hit it sees `setup_required: true` and runs the one-time setup wizard (`POST /api/auth/setup`), which creates the admin user, their workspace, and **adopts** any pre-existing `workspace_id=0` rows into that workspace.
+On an empty database the app seeds three default channels and waits. The first browser to hit it sees `setup_required: true` and runs the one-time setup wizard (`POST /api/auth/setup`). The wizard must send `setup_code`, a random code (`SETUP_CODE`) generated on every start and printed to the log while no account exists. Setup creates the admin user, their workspace, and **adopts** any pre-existing `workspace_id=0` rows into that workspace.
 
 ---
 
@@ -105,7 +105,7 @@ On an empty database the app seeds three default channels and waits. The first b
 ```
 ┌──────────────────────────────────────────────┐
 │  Browser (single index.html, vanilla JS)      │
-│  fetch() → /api/*   ·   cookie: contentcal_session │
+│  fetch() → /api/*   ·   cookie: contentcal_session_<tag> │
 └───────────────┬──────────────────────────────┘
                 │ same-origin HTTP
 ┌───────────────▼──────────────────────────────┐
@@ -180,8 +180,13 @@ Every domain row carries a `workspace_id`. The golden rule:
 ## 7. Authentication & sessions
 
 - **Passwords** — bcrypt via the `bcrypt` package. Inputs are truncated to bcrypt's 72-byte limit (`hash_password` / `verify_password`) so long passphrases don't raise. Minimum length is 8 chars.
-- **Sessions** — a signed (not encrypted) token via `itsdangerous.URLSafeSerializer`, carrying `{uid, wsid}`. Stored in the `contentcal_session` cookie: `httponly`, `samesite=lax`, `max_age=30 days`, `secure=False` (terminate TLS at a reverse proxy in front).
-- **Session secret** — from `SESSION_SECRET` env, else a generated secret persisted to `/app/data/.session_secret` (chmod 600) so cookies survive restarts. **Multi-replica deployments must set `SESSION_SECRET`** or sessions will randomly 401 as requests round-robin; the app warns about this on startup.
+- **Sessions** — a signed (not encrypted), timestamped token via `itsdangerous.URLSafeTimedSerializer`, carrying `{uid, wsid, sv}`. The server rejects tokens older than 30 days, and `sv` must match `user.session_version`; logout bumps that version, which revokes every cookie for the account on all devices. Stored in the `contentcal_session_<tag>` cookie, where `<tag>` is 8 hex chars derived from the session secret so installs on one host don't collide (`__Host-` prefix added with `COOKIE_SECURE=1`): `httponly`, `samesite=lax`, `max_age=30 days`, `secure` only when `COOKIE_SECURE=1` (set it when served over HTTPS).
+- **Throttling** — failed logins are counted per *(exact username, client IP)* (10 / 15 min) and per username across all IPs (50 / 15 min). A browser that has signed in to the account before carries a signed `contentcal_device_<tag>` cookie and gets its own bucket (10 / 15 min) instead, so strangers can't lock the owner out. Generous per-IP caps (login 100 / 15 min, signup 30 / hour, invite preview 60 / min) only stop floods, because many users can share an IP. Setup is capped at 10 / 15 min per IP. Over a cap returns `429`.
+- **Password change** — `POST /api/me/password` needs the current password, bumps `session_version` (signing out every other device) and re-issues this browser's cookie.
+- **Request guard** — `RequestGuardMiddleware` refuses `/api/*` calls that need a login but carry no validly signed session cookie (401) *before reading the body*, and caps bodies per route: 16 KB public, 256 KB authenticated, `MAX_REQUEST_BYTES` (2.5 MB) for `PUT /api/channels` and `POST /api/entries/bulk`, with at most two large bodies in flight. Those two endpoints check the array length before validating items, and 422 responses never echo input.
+- **Usernames** — new accounts must match `[A-Za-z0-9_.-]{2,80}` and be unique ignoring case. Login is exact-match.
+- **Session secret** — from `SESSION_SECRET` env, else a generated secret persisted to `/app/data/.session_secret` (chmod 600) so cookies survive restarts.
+- **Single process only** — rate limits and the setup code are in memory, and SQLite setup isn't safe across concurrent processes, so run exactly one container with one uvicorn worker.
 
 Switching the active workspace (`PUT /api/me/active-workspace`) re-issues the cookie and persists the choice as the user's new `default_workspace_id`.
 
@@ -191,7 +196,8 @@ Switching the active workspace (`PUT /api/me/active-workspace`) re-issues the co
 
 Two roles: `owner` and `member`. The code enforces several invariants so a workspace can never end up ownerless while members remain:
 
-- **`_require_owner`** gates rename, settings, member management, and invite creation/revocation.
+- **`_require_owner`** gates rename, settings, member management, and invite creation/revocation. The `owner_workspace` dependency also makes channel edits (`PUT`/`DELETE /api/channels`) and the goal (`PUT /api/goal`) owner-only.
+- **Members** can add, edit, and delete videos and comments. `GET .../invites` returns `[]` for them so invite links stay with owners. `/api/me` includes each workspace's `role` so the UI hides owner-only controls.
 - **Last-owner protection** — an owner can't be demoted or removed if they're the only owner *and* other members exist; you must promote a successor first.
 - **Auto-heir** — if the *sole* owner leaves a workspace that still has members, ownership auto-passes to the **longest-tenured** remaining member (`order_by(joined_at)`).
 - **Cascade on empty** — if the *last* member leaves, the workspace and all its data are deleted.
@@ -204,10 +210,10 @@ Comment moderation: authors can edit/delete their own comments; **owners can del
 ## 9. Invites
 
 - `POST /api/workspaces/{id}/invites` (owner only) mints a `secrets.token_urlsafe(12)` code with optional `expires_in_days`.
-- `GET /api/invites/{code}` is **public** (so a signup page can preview which workspace an invite is for) and **rate-limited per IP** (20 hits / 60 s via an in-memory token-bucket) to make code enumeration infeasible. It does *not* consume the invite.
+- `GET /api/invites/{code}` is **public** (so a signup page can preview which workspace an invite is for) and **rate-limited per IP** (60 hits / 60 s, in memory) to make code enumeration infeasible. It does *not* consume the invite.
 - Claiming an invite (via signup with `invite_code`, or `POST /api/invites/{code}/accept` when logged in) uses a **conditional `UPDATE … WHERE used_by_user_id IS NULL AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now)`** and checks `rowcount == 1`, so two concurrent accepts can't both succeed.
 
-> ⚠️ The rate limiter is in-memory and per-process. Behind a horizontal scaler, put a real WAF/rate-limiter in front.
+> ⚠️ The rate limiter is in-memory and per-process, one more reason ContentCal must run as a single process.
 
 ---
 
@@ -254,13 +260,14 @@ Centralized helpers at the top of `main.py` enforce:
 | Rule | Limit |
 |---|---|
 | Channel color | `#RRGGBB` hex or empty |
-| Channel icon | `data:image/*` or `https://` URL, ≤ 300 KB, no HTML-breaking chars |
+| Channel icon | Uploaded `data:image/*` only (remote URLs would act as tracking pixels), ≤ 300 KB, no HTML-breaking chars. Legacy `https://` icons are returned as `""`. |
 | Status / format | Whitelisted enums |
 | Title | ≤ 300 chars, required |
 | Notes | ≤ 20,000 chars |
 | Pillar | ≤ 200 chars · Link ≤ 2,000 chars · Comment ≤ 5,000 chars |
 | Channels per workspace | 1–6 |
-| Bulk import | ≤ 1,000 rows / request |
+| Bulk import | ≤ 1,000 rows and ≤ `MAX_REQUEST_BYTES` per request (the frontend chunks by UTF-8 size); each row is inserted in its own SAVEPOINT |
+| Request bodies | 16 KB public · 256 KB authenticated · 2.5 MB channel save / bulk import |
 | Date | must parse as ISO `YYYY-MM-DD`; required for `scheduled`/`published` |
 
 `_validate_entry_payload` is the single normalization point for both `POST` and `PUT /api/entries` (and bulk), and it confirms the `channel` index is in range for the workspace.
@@ -284,10 +291,11 @@ All routes are same-origin and (except where noted) require the session cookie. 
 |---|---|---|
 | GET | `/api/auth/setup-required` | Is first-run setup needed? |
 | POST | `/api/auth/setup` | One-time admin + workspace creation |
-| POST | `/api/auth/signup` | Open signup (optional `invite_code`) |
+| POST | `/api/auth/signup` | Sign up; `invite_code` required unless `ALLOW_OPEN_SIGNUP=1` |
 | POST | `/api/auth/login` | Log in, set cookie |
-| POST | `/api/auth/logout` | Clear cookie |
+| POST | `/api/auth/logout` | Revoke all of the user's sessions and clear cookie |
 | GET | `/api/me` | Current user + their workspaces |
+| POST | `/api/me/password` | Change password (needs current); signs out other devices |
 | PUT | `/api/me/active-workspace` | Switch active workspace |
 
 ### Workspaces & members
@@ -330,13 +338,13 @@ All routes are same-origin and (except where noted) require the session cookie. 
 | PUT | `/api/comments/{id}` | Edit own comment |
 | DELETE | `/api/comments/{id}` | Delete (author or owner) |
 
-> Interactive OpenAPI docs are served at **`/docs`** (FastAPI default).
+> Interactive OpenAPI docs (`/docs`, `/redoc`, `/openapi.json`) are **off by default**. Set `ENABLE_API_DOCS=1` to turn them on for development. Note that `/docs` loads Swagger UI from a third-party CDN.
 
 ---
 
 ## 16. Frontend notes
 
-The entire UI is one `index.html` with inline CSS and JS — no build, no dependencies beyond a CDN icon font (Lucide). Key conventions:
+The entire UI is one `index.html` with inline CSS and JS — no build, no dependencies beyond the Lucide icon library, vendored at `frontend/vendor/lucide.min.js`. Key conventions:
 
 - **State** lives in module-level globals (`channels`, `entries`, `goal`, `calView`, `channelVisibility`, …); the app re-renders by calling `render()`.
 - **Views** are switched by `setCalView('month'|'list'|'kanban'|'backlog'|'quarter'|'year')`, which toggles the relevant container and active tab. On narrow viewports it auto-falls back to `list`.
@@ -354,7 +362,7 @@ The entire UI is one `index.html` with inline CSS and JS — no build, no depend
 
 ## 17. Testing
 
-~80 pytest regression tests live in `backend/tests/`, organized by concern:
+~110 pytest regression tests live in `backend/tests/`, organized by concern:
 
 ```
 test_auth.py                test_invites.py
@@ -362,15 +370,19 @@ test_auto_publish.py        test_roles.py
 test_bulk_import.py         test_workspace_isolation.py
 test_cascade_delete.py      test_comments.py
 test_channels_race.py       test_entries.py
+test_security.py
 ```
 
 Run them via the Makefile:
 
 ```bash
-make setup          # install dev deps + wire the pre-push hook
-make test           # run the suite (~30s)
+make setup          # build the test image + wire the pre-push hook
+make test           # run the suite in Docker (~60s)
+make test-local     # run it on your own Python 3.11+ (after `make dev-deps`)
 make install-hooks  # (re-)install the pre-push hook on a fresh clone
 ```
+
+`make test` builds the `test` stage of `backend/Dockerfile` (same Python and pinned deps as the app) and mounts `backend/` and `frontend/` into it, so there's nothing to install locally beyond Docker. The app needs Python 3.11+ (Starlette 1.x) if you run it outside Docker.
 
 After `make install-hooks`, every `git push` runs the suite first and blocks on failure (bypass with `git push --no-verify`). `test_channels_race.py` and `test_workspace_isolation.py` are the ones that guard the trickiest invariants (positional channels, tenant scoping) — keep them green when touching that code.
 
@@ -383,8 +395,14 @@ After `make install-hooks`, every `git push` runs the suite first and blocks on 
 | `DATA_DIR` | `/app/data` | The only data-path setting: holds `calendar.db`, `.session_secret`, and legacy `calendar.json` (imported on first run). Logged on startup. |
 | `APPDATA` (compose only, from `.env`) | _(required)_ | Host folder whose `contentcal/` subfolder is mounted at `/app/data`. `docker compose` errors out if unset. |
 | `REQUIRE_EXISTING_DB` | _(unset)_ | `1` = refuse to start if `$DATA_DIR/calendar.db` is missing instead of creating an empty one. Set in `docker-compose.yml`; comment out for a brand-new install's first run. |
-| `SESSION_SECRET` | on-disk generated | **Set this for multi-replica deploys** |
+| `SESSION_SECRET` | on-disk generated | Signs cookies; changing it signs everyone out |
+| `SETUP_CODE` | random per start | Fixed first-run setup code (optional) |
 | `ALLOWED_ORIGINS` | _(none)_ | Comma-separated CORS origins; never `*` (cookies need credentialed CORS) |
+| `FORWARDED_ALLOW_IPS` | `127.0.0.1` | Read by uvicorn: proxy IPs/CIDRs whose `X-Forwarded-For` sets the client IP (the app never reads the header itself). Set it to the proxy container's IP/subnet only when the app port isn't published, or to the Docker gateway only when the port is published on `127.0.0.1`. Without it every user behind the proxy shares one rate-limit bucket; trusting a gateway other machines can reach lets anyone spoof their IP. |
+| `ALLOW_OPEN_SIGNUP` | _(unset)_ | `1` lets anyone create an account. Default: sign-up needs a valid invite, and the account is only created if the invite is claimed. |
+| `COOKIE_SECURE` | _(unset)_ | `1` marks the session cookie `Secure` (HTTPS-only). Leave unset for plain-HTTP LAN use. |
+| `ENABLE_API_DOCS` | _(unset)_ | `1` serves `/docs`, `/redoc`, `/openapi.json` (dev only; `/docs` loads from a CDN). |
+| `MAX_REQUEST_BYTES` | `2621440` (2.5 MB) | Cap for `PUT /api/channels` and `POST /api/entries/bulk`; other routes use fixed 256 KB / 16 KB caps. Larger bodies get `413`. |
 
 Port: container listens on `8000`; `docker-compose.yml` maps host `8765 → 8000`.
 
@@ -393,11 +411,17 @@ Port: container listens on `8000`; `docker-compose.yml` maps host `8765 → 8000
 ## 19. Security notes & hardening
 
 - **Same-origin by default** — frontend is served by the API process; CORS is off unless `ALLOWED_ORIGINS` is set, and `*` is deliberately rejected.
-- **Cookies** are `httponly` + `samesite=lax`. `secure=False` in code — **front it with TLS** (reverse proxy / Tailscale) in production.
-- **Session tokens are signed, not encrypted** — they contain only `uid`/`wsid`, no secrets, but rotating `SESSION_SECRET` invalidates all sessions.
-- **Rate limiting is in-memory/per-process** — fine for a single container; add a real WAF if you scale out or expose it publicly.
+- **Cookies** are `httponly` + `samesite=lax`, and `Secure` with `COOKIE_SECURE=1` — **front it with TLS** (reverse proxy / Tailscale) in production.
+- **Security headers** on every response: a CSP limiting fetches, images, scripts and fonts to this origin (`connect-src`/`img-src 'self'`, `frame-ancestors 'none'`; inline script/style allowed because the frontend is one file), `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, plus `Strict-Transport-Security` with `COOKIE_SECURE=1`. The CSP can't block top-level navigation (`location=`, `window.open`), so it limits XSS damage rather than preventing exfiltration outright.
+- **Cookie isolation** — cookies are shared across ports on one host, so other apps on the same host receive ContentCal's cookies. Only a dedicated hostname per app (behind a reverse proxy, with `COOKIE_SECURE=1`) isolates them.
+- **Data files** are created owner-only (umask `077`); an existing `calendar.db` is chmod'ed `600` at startup.
+- **Login timing** — unknown usernames are checked against a dummy bcrypt hash, so response time doesn't reveal which accounts exist.
+- **Session tokens are signed, not encrypted** — they contain only `uid`/`wsid`/`sv`, no secrets, but rotating `SESSION_SECRET` invalidates all sessions.
+- **No third-party requests** — Lucide is vendored at `frontend/vendor/lucide.min.js` (pinned v1.49.0) and the UI uses system fonts, so a page load only talks to your server.
+- **Rate limiting is in-memory/per-process** — fine for the single supported container. Behind a reverse proxy set `FORWARDED_ALLOW_IPS` to the proxy only (never a gateway other machines can reach), or all users share one bucket.
 - **Icon/notes/link inputs are bounded and sanitized** server-side (defense in depth against stored XSS even if the client forgets to escape).
-- **No password reset flow** exists out of the box — an operator with DB access resets hashes directly. Worth adding if you open signups widely.
+- **No password reset flow** for forgotten passwords — users can change their own password, but a forgotten one needs an operator with DB access to reset the hash.
+- **CSV export** prefixes cells starting with `=`, `+`, `-`, `@`, tab or CR with `'` so spreadsheets don't run them as formulas; import strips it again.
 
 ---
 

@@ -75,7 +75,7 @@ docker compose up -d --build
 #    http://<your-nas-ip>:8765
 ```
 
-The first person to open the app runs a one-time setup wizard that creates the admin account and the first workspace. From there, invite teammates or spin up more workspaces.
+The first person to open the app runs a one-time setup wizard that creates the admin account and the first workspace. It asks for a setup code printed in the server logs, so only whoever runs the server can claim it. From there, invite teammates or spin up more workspaces.
 
 ## Tech at a glance
 

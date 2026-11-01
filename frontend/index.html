@@ -4,8 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ContentCal</title>
-<link href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,600,700&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/lucide@latest/dist/umd/lucide.min.js"></script>
+<!-- Served locally so the app makes no third-party requests (lucide v1.49.0, ISC). -->
+<script src="vendor/lucide.min.js"></script>
 <style>
 :root,[data-theme="light"]{
   --color-bg:#f7f6f2;--color-surface:#f9f8f5;--color-surface-2:#fbfbf9;
@@ -27,7 +27,7 @@
   --text-base:clamp(1rem,0.95rem + 0.25vw,1.125rem);--text-lg:clamp(1.125rem,1rem + 0.75vw,1.5rem);--text-xl:clamp(1.5rem,1.2rem + 1.25vw,2.25rem);
   --space-1:.25rem;--space-2:.5rem;--space-3:.75rem;--space-4:1rem;--space-5:1.25rem;
   --space-6:1.5rem;--space-8:2rem;--space-10:2.5rem;--space-12:3rem;--space-16:4rem;
-  --font-body:'Satoshi','Helvetica Neue',sans-serif;
+  --font-body:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
 }
 [data-theme="dark"]{
   --color-bg:#171614;--color-surface:#1c1b19;--color-surface-2:#201f1d;
@@ -456,7 +456,7 @@ body.app-busy{cursor:progress}
         <span class="btn-text">Export CSV</span>
       </button>
       <button class="btn-icon" data-theme-toggle aria-label="Toggle dark mode"><i data-lucide="sun" style="width:16px;height:16px"></i></button>
-      <button class="btn-icon" onclick="toggleChannelPanel()" title="Manage channels"><i data-lucide="settings-2" style="width:16px;height:16px"></i></button>
+      <button class="btn-icon" id="manage-channels-btn" onclick="toggleChannelPanel()" title="Manage channels"><i data-lucide="settings-2" style="width:16px;height:16px"></i></button>
       <button class="btn-primary" onclick="openAddModal()" id="add-btn"><i data-lucide="plus" style="width:16px;height:16px"></i><span class="btn-add-text">Add Video</span></button>
       <div class="user-menu" id="user-menu-wrap" style="display:none">
         <button class="user-menu-btn" onclick="toggleUserMenu(event)" aria-label="Account menu">
@@ -578,6 +578,20 @@ body.app-busy{cursor:progress}
   </div>
 </div>
 
+<div class="goal-modal-overlay" id="password-modal" onclick="if(event.target===this)closePasswordModal()">
+  <div class="modal" role="dialog" aria-modal="true" style="max-width:420px">
+    <div class="modal-header"><h2 class="modal-title">Change password</h2><button class="btn-icon" onclick="closePasswordModal()"><i data-lucide="x" style="width:18px;height:18px"></i></button></div>
+    <form onsubmit="savePassword(event)">
+      <div class="modal-body">
+        <div class="form-group"><label class="form-label" for="pw-current">Current password</label><input class="form-input" id="pw-current" type="password" autocomplete="current-password" required></div>
+        <div class="form-group"><label class="form-label" for="pw-new">New password <span style="font-weight:400;color:var(--color-text-muted);font-size:11px">(min 8 characters)</span></label><input class="form-input" id="pw-new" type="password" autocomplete="new-password" minlength="8" required></div>
+        <div style="font-size:var(--text-xs);color:var(--color-text-muted)">You'll stay signed in here. Every other device is signed out.</div>
+      </div>
+      <div class="modal-footer"><button type="button" class="btn-secondary" onclick="closePasswordModal()">Cancel</button><button type="submit" class="btn-primary" id="pw-save-btn"><i data-lucide="check" style="width:14px;height:14px"></i>Change password</button></div>
+    </form>
+  </div>
+</div>
+
 <!-- Import Modal -->
 <div class="import-modal-overlay" id="import-modal" onclick="if(event.target===this)closeImportModal()">
   <div class="modal" role="dialog" aria-modal="true" style="max-width:560px">
@@ -680,7 +694,7 @@ function safeUrl(url){return url&&/^https?:\/\//i.test(String(url).trim())?escHt
 // trust persisted data when it's about to land in an HTML attribute. These
 // helpers refuse anything that isn't an exact #RRGGBB hex / safe image src.
 function safeColor(c){c=String(c||'').trim();return /^#[0-9a-fA-F]{6}$/.test(c)?c:'';}
-function safeIcon(s){s=String(s||'').trim();if(!s||s.length>300000)return '';if(/["'<>\n\r]/.test(s))return '';return /^(data:image\/|https:\/\/)/.test(s)?escHtml(s):'';}
+function safeIcon(s){s=String(s||'').trim();if(!s||s.length>300000)return '';if(/["'<>\n\r]/.test(s))return '';return /^data:image\//.test(s)?escHtml(s):'';}
 // Whitelist status/format so a hostile API can't break out of class="".
 const VALID_STATUSES_FE=new Set(['idea','filming','editing','ready','scheduled','published']);
 const VALID_FORMATS_FE=new Set(['','short','long']);
@@ -801,6 +815,9 @@ async function apiFetch(path,options={}){
     throw new Error(body||'Conflict');
   }
   if(!res.ok){
+    // A 403 usually means our cached role is stale (another owner changed
+    // it); refresh so the UI shows the right controls.
+    if(res.status===403&&currentUser&&!path.startsWith('/api/auth/')&&path!=='/api/data')setTimeout(()=>loadData(),0);
     let msg='Request failed';
     try{const body=await res.text();msg=body||msg;}catch{}
     throw new Error(msg);
@@ -814,9 +831,12 @@ async function apiFetch(path,options={}){
 let currentUser=null;          // {id, username, default_workspace_id}
 let currentWorkspace=null;     // active workspace object
 let userWorkspaces=[];         // all workspaces the user is in
+let openSignup=false;          // server allows sign-up without an invite (ALLOW_OPEN_SIGNUP)
 let pendingInviteCode=null;    // captured from #join=CODE in the URL
 
 // Initials for avatar circle
+function isWorkspaceOwner(){return !!(currentWorkspace&&currentWorkspace.role==='owner');}
+
 function userInitials(name){
   if(!name)return '?';
   const parts=name.trim().split(/[\s_-]+/);
@@ -846,12 +866,13 @@ function showAuthScreen(view){
       <div class="auth-sub">Let's create your admin account. Any existing data will be moved into your new workspace.</div>
       ${errBlock}
       <form class="auth-form" onsubmit="submitSetup(event)">
-        <div class="form-group"><label class="form-label" for="setup-username">Username</label><input class="form-input" id="setup-username" type="text" autocomplete="username" required minlength="2"></div>
+        <div class="form-group"><label class="form-label" for="setup-username">Username</label><input class="form-input" id="setup-username" type="text" autocomplete="username" required minlength="2" maxlength="80" pattern="[A-Za-z0-9_.\\-]+" title="Letters, numbers, _ . or -"></div>
         <div class="form-group"><label class="form-label" for="setup-password">Password <span style="font-weight:400;color:var(--color-text-muted);font-size:11px">(min 8 characters)</span></label><input class="form-input" id="setup-password" type="password" autocomplete="new-password" required minlength="8"></div>
+        <div class="form-group"><label class="form-label" for="setup-code">Setup code <span style="font-weight:400;color:var(--color-text-muted);font-size:11px">(printed in the server logs, e.g. <code>docker logs contentcal</code>)</span></label><input class="form-input" id="setup-code" type="text" autocomplete="off" spellcheck="false" required style="text-transform:uppercase;font-family:monospace"></div>
         <div class="form-group"><label class="form-label" for="setup-wsname">Workspace name <span style="font-weight:400;color:var(--color-text-muted);font-size:11px">(optional)</span></label><input class="form-input" id="setup-wsname" type="text" placeholder="My Content Workspace"></div>
         <button type="submit" class="btn-primary" style="justify-content:center;margin-top:var(--space-2)">Create account</button>
       </form>`;
-    setTimeout(()=>document.getElementById('setup-username').focus(),50);
+    setTimeout(()=>document.getElementById('setup-username')?.focus(),50);
   } else if(view==='signup'){
     const invitePill=pendingInviteCode
       ?`<div class="auth-invite-pill"><i data-lucide="ticket" style="width:14px;height:14px"></i><span>You're joining <strong id="invite-ws-name">a workspace</strong> with this signup.</span></div>`
@@ -862,13 +883,13 @@ function showAuthScreen(view){
       ${invitePill}
       ${errBlock}
       <form class="auth-form" onsubmit="submitSignup(event)">
-        <div class="form-group"><label class="form-label" for="signup-username">Username</label><input class="form-input" id="signup-username" type="text" autocomplete="username" required minlength="2"></div>
+        <div class="form-group"><label class="form-label" for="signup-username">Username</label><input class="form-input" id="signup-username" type="text" autocomplete="username" required minlength="2" maxlength="80" pattern="[A-Za-z0-9_.\\-]+" title="Letters, numbers, _ . or -"></div>
         <div class="form-group"><label class="form-label" for="signup-password">Password <span style="font-weight:400;color:var(--color-text-muted);font-size:11px">(min 8 characters)</span></label><input class="form-input" id="signup-password" type="password" autocomplete="new-password" required minlength="8"></div>
         <button type="submit" class="btn-primary" style="justify-content:center;margin-top:var(--space-2)">Sign up</button>
       </form>
       <div class="auth-switch">Already have an account? <a onclick="showAuthScreen('login')">Log in</a></div>`;
     if(pendingInviteCode)previewInvite(pendingInviteCode);
-    setTimeout(()=>document.getElementById('signup-username').focus(),50);
+    setTimeout(()=>document.getElementById('signup-username')?.focus(),50);
   } else {
     // default: login
     body.innerHTML=`
@@ -880,8 +901,8 @@ function showAuthScreen(view){
         <div class="form-group"><label class="form-label" for="login-password">Password</label><input class="form-input" id="login-password" type="password" autocomplete="current-password" required></div>
         <button type="submit" class="btn-primary" style="justify-content:center;margin-top:var(--space-2)">Log in</button>
       </form>
-      <div class="auth-switch">Need an account? <a onclick="showAuthScreen('signup')">Sign up</a></div>`;
-    setTimeout(()=>document.getElementById('login-username').focus(),50);
+      <div class="auth-switch">${openSignup||pendingInviteCode?`Need an account? <a onclick="showAuthScreen('signup')">Sign up</a>`:'Need an account? Ask a workspace owner for an invite link.'}</div>`;
+    setTimeout(()=>document.getElementById('login-username')?.focus(),50);
   }
   lucide.createIcons({nodes:[body]});
 }
@@ -905,7 +926,7 @@ async function previewInvite(code){
     pendingInviteCode=null;
     const pill=document.querySelector('.auth-invite-pill');
     if(pill)pill.remove();
-    authError('That invite link is no longer valid. You can still sign up.');
+    authError(openSignup?'That invite link is no longer valid. You can still sign up.':'That invite link is no longer valid. Ask a workspace owner for a new one.');
   }
 }
 
@@ -918,7 +939,8 @@ async function submitSetup(ev){
     const username=document.getElementById('setup-username').value.trim();
     const password=document.getElementById('setup-password').value;
     const wsname=document.getElementById('setup-wsname').value.trim();
-    await apiFetch('/api/auth/setup',{method:'POST',body:{username,password,workspace_name:wsname||null}});
+    const setup_code=document.getElementById('setup-code').value.trim();
+    await apiFetch('/api/auth/setup',{method:'POST',body:{username,password,setup_code,workspace_name:wsname||null}});
     await bootAfterAuth();
   }catch(e){authError(parseErr(e));}});
 }
@@ -955,7 +977,11 @@ async function submitLogin(ev){
 function parseErr(e){
   const m=(e&&e.message)||'';
   // Backend returns FastAPI JSON error envelopes; pull `detail` if present.
-  try{const j=JSON.parse(m);return j.detail||m;}catch{return m;}
+  try{
+    const j=JSON.parse(m);
+    if(Array.isArray(j.detail))return j.detail.map(d=>d&&d.msg?d.msg:String(d)).join('; ');
+    return j.detail||m;
+  }catch{return m;}
 }
 
 // ── Boot sequence ─────────────────────────────────────────────────
@@ -965,6 +991,7 @@ async function bootApp(){
   if(hash.join){pendingInviteCode=hash.join;}
   try{
     const setup=await apiFetch('/api/auth/setup-required');
+    openSignup=!!setup.open_signup;
     if(setup.setup_required){showAuthScreen('setup');return;}
   }catch(e){/* fall through; loadData will show connection error */}
   // Try to resolve current session
@@ -1009,6 +1036,9 @@ async function bootAfterAuth(){
 // ── Header user UI ────────────────────────────────────────────────
 function renderHeaderUserUi(){
   if(!currentUser)return;
+  // Channels and the goal are owner-only (the API enforces it); hide the
+  // controls members can't use.
+  document.getElementById('manage-channels-btn').style.display=isWorkspaceOwner()?'':'none';
   // User menu
   const wrap=document.getElementById('user-menu-wrap');
   wrap.style.display='';
@@ -1019,6 +1049,7 @@ function renderHeaderUserUi(){
       <div style="font-size:10px;color:var(--color-text-muted)">${escHtml(currentWorkspace?currentWorkspace.name:'')}</div>
     </div>
     <button class="ws-menu-item" onclick="toggleWorkspacePanel()"><i data-lucide="settings-2" style="width:13px;height:13px"></i>Workspace settings</button>
+    <button class="ws-menu-item" onclick="openPasswordModal()"><i data-lucide="key-round" style="width:13px;height:13px"></i>Change password</button>
     <button class="ws-menu-item" onclick="doLogout(this)"><i data-lucide="log-out" style="width:13px;height:13px"></i>Log out</button>`;
   lucide.createIcons({nodes:[document.getElementById('user-menu-panel')]});
   // Workspace switcher
@@ -1060,6 +1091,7 @@ async function promptCreateWorkspace(btn){
   if(!name||!name.trim())return;
   return withBusy(btn,async()=>{try{
     const ws=await apiFetch('/api/workspaces',{method:'POST',body:{name:name.trim()}});
+    ws.role=ws.role||'owner';
     userWorkspaces.push(ws);
     currentWorkspace=ws;
     channelVisibility=[];selectedIds.clear();selectionMode=false;
@@ -1099,6 +1131,11 @@ async function toggleWorkspacePanel(){
   }
 }
 
+// Members shown in the open workspace panel. Handlers look names up here so
+// user-controlled text never lands inside an inline onclick="..." string.
+let panelMembers=[];
+function panelMemberName(userId){return (panelMembers.find(m=>m.user_id===userId)||{}).username||'this member';}
+
 async function renderWorkspacePanel(){
   if(!currentWorkspace)return;
   const wsid=currentWorkspace.id;
@@ -1112,6 +1149,14 @@ async function renderWorkspacePanel(){
     body.innerHTML=emptyStateHtml({icon:'wifi-off',title:"Couldn't load workspace settings",sub:'Check your connection and try again.',action:`<button class="btn-primary" onclick="withBusy(this,renderWorkspacePanel)">Retry</button>`,compact:true});
     lucide.createIcons({nodes:[body]});
     return;
+  }
+  panelMembers=members;
+  // Keep the cached role in sync (e.g. after stepping down) so owner-only
+  // controls appear/disappear without a reload.
+  const meRow=members.find(m=>m.is_you);
+  if(meRow&&currentWorkspace.role!==meRow.role){
+    currentWorkspace.role=meRow.role;
+    renderHeaderUserUi();renderChannelBadges();renderGoalBanner();
   }
   const youAreOwner=members.some(m=>m.is_you&&m.role==='owner');
   const inviteRows=invites.length?invites.map(i=>{
@@ -1132,19 +1177,19 @@ async function renderWorkspacePanel(){
     // owner-only and refused server-side if it would orphan the workspace.
     const actions=[];
     if(youAreOwner&&m.role!=='owner'){
-      actions.push(`<button class="btn-ghost" onclick="setMemberRole(${m.user_id},'owner','${escHtml(m.username)}',this)" style="font-size:11px;padding:var(--space-1) var(--space-2)" title="Promote to owner"><i data-lucide="arrow-up" style="width:12px;height:12px"></i>Promote</button>`);
+      actions.push(`<button class="btn-ghost" onclick="setMemberRole(${Number(m.user_id)},'owner',this)" style="font-size:11px;padding:var(--space-1) var(--space-2)" title="Promote to owner"><i data-lucide="arrow-up" style="width:12px;height:12px"></i>Promote</button>`);
     }
     if(youAreOwner&&m.role==='owner'&&ownerCount>1){
       const verb=m.is_you?'Step down':'Demote';
-      actions.push(`<button class="btn-ghost" onclick="setMemberRole(${m.user_id},'member','${escHtml(m.username)}',this)" style="font-size:11px;padding:var(--space-1) var(--space-2)" title="Demote to member"><i data-lucide="arrow-down" style="width:12px;height:12px"></i>${verb}</button>`);
+      actions.push(`<button class="btn-ghost" onclick="setMemberRole(${Number(m.user_id)},'member',this)" style="font-size:11px;padding:var(--space-1) var(--space-2)" title="Demote to member"><i data-lucide="arrow-down" style="width:12px;height:12px"></i>${verb}</button>`);
     }
     if(m.is_you){
       actions.push(`<button class="btn-ghost" onclick="leaveWorkspace(this)" style="font-size:11px;color:var(--color-error);padding:var(--space-1) var(--space-2)">Leave</button>`);
     }else if(youAreOwner&&(m.role!=='owner'||ownerCount>1)){
-      actions.push(`<button class="btn-ghost" onclick="removeMember(${m.user_id},'${escHtml(m.username)}',this)" style="font-size:11px;color:var(--color-error);padding:var(--space-1) var(--space-2)">Remove</button>`);
+      actions.push(`<button class="btn-ghost" onclick="removeMember(${Number(m.user_id)},this)" style="font-size:11px;color:var(--color-error);padding:var(--space-1) var(--space-2)">Remove</button>`);
     }
     return `<div class="member-row">
-      <div style="display:flex;align-items:center;gap:var(--space-2)"><div class="user-avatar" style="width:24px;height:24px;font-size:10px">${userInitials(m.username)}</div><span>${escHtml(m.username)}${youTag}${roleBadge}</span></div>
+      <div style="display:flex;align-items:center;gap:var(--space-2)"><div class="user-avatar" style="width:24px;height:24px;font-size:10px">${escHtml(userInitials(m.username))}</div><span>${escHtml(m.username)}${youTag}${roleBadge}</span></div>
       <div style="display:flex;gap:var(--space-1)">${actions.join('')}</div>
     </div>`;
   }).join('');
@@ -1205,7 +1250,8 @@ async function _loadTzOptions(){
     list.innerHTML=_tzListCache.map(tz=>`<option value="${escHtml(tz)}">`).join('');
   }catch{}
 }
-async function setMemberRole(userId,role,username,btn){
+async function setMemberRole(userId,role,btn){
+  const username=panelMemberName(userId);
   const isSelf=currentUser&&userId===currentUser.id;
   const verb=role==='owner'?'Promote':(isSelf?'Step down as':'Demote');
   const subject=isSelf?'yourself':`"${username}"`;
@@ -1250,7 +1296,8 @@ function copyInviteUrl(url){
   navigator.clipboard?.writeText(url).then(()=>showToast('Copied to clipboard'),()=>showToast('Copy failed','error'));
 }
 
-async function removeMember(userId,username,btn){
+async function removeMember(userId,btn){
+  const username=panelMemberName(userId);
   if(!confirm(`Remove ${username} from this workspace?`))return;
   return withBusy(btn,async()=>{try{
     await apiFetch(`/api/workspaces/${currentWorkspace.id}/members/${userId}`,{method:'DELETE'});
@@ -1299,6 +1346,12 @@ async function loadData(){
     // Always trust the server's goal — empty payload means "no goal".
     goal=data.goal||{name:'',target:0,deadline:''};
     channelsVersion=data.channels_version||0;
+    // Pick up role changes made by another owner while this tab was open.
+    if(currentWorkspace&&data.role&&currentWorkspace.role!==data.role){
+      currentWorkspace.role=data.role;
+      const wsi=userWorkspaces.findIndex(w=>w.id===currentWorkspace.id);if(wsi>=0)userWorkspaces[wsi].role=data.role;
+      renderHeaderUserUi();
+    }
     channelVisibility=channels.map((_,i)=>channelVisibility[i]!==false);
     renderChannelBadges();renderChannelSelects();
     if(window.innerWidth<768)setCalView('list');else render();
@@ -1321,7 +1374,7 @@ function renderChannelSelects(){
 function renderChannelBadges(){
   const bar=document.getElementById('channel-bar-badges');if(!bar)return;
   if(activeChannelCount()===0){
-    bar.innerHTML=`<span style="font-size:var(--text-xs);color:var(--color-text-faint);font-style:italic">No channels yet</span><button class="btn-ghost" onclick="toggleChannelPanel()" style="font-size:var(--text-xs)"><i data-lucide="plus" style="width:13px;height:13px"></i>Add a channel</button>`;
+    bar.innerHTML=`<span style="font-size:var(--text-xs);color:var(--color-text-faint);font-style:italic">No channels yet</span>${isWorkspaceOwner()?`<button class="btn-ghost" onclick="toggleChannelPanel()" style="font-size:var(--text-xs)"><i data-lucide="plus" style="width:13px;height:13px"></i>Add a channel</button>`:''}`;
     lucide.createIcons({nodes:[bar]});return;
   }
   bar.innerHTML=channels.map((ch,i)=>{
@@ -1335,7 +1388,7 @@ function renderChannelBadges(){
     const leading=ci
       ?`<img src="${ci}" style="width:16px;height:16px;border-radius:50%;object-fit:cover">`
       :(cc?`<div class="channel-dot" style="background:${cc}"></div>`:`<div class="channel-dot ${CH_CLASSES(i)}-dot"></div>`);
-    const canArchive=activeChannelCount()>1;
+    const canArchive=isWorkspaceOwner()&&activeChannelCount()>1;
     const archiveBtn=canArchive?`<button class="badge-archive-btn" onclick="event.stopPropagation();archiveChannel(${i})" title="Archive channel" aria-label="Archive ${escHtml(ch.name)}">×</button>`:'';
     return `<div class="${cls}${channelVisibility[i]?'':' dimmed'}" id="badge-${i}" onclick="toggleChannel(${i})" role="button" aria-pressed="${channelVisibility[i]}" ${sty}>${leading}<span id="badge-name-${i}">${escHtml(ch.name)}</span>${archiveBtn}</div>`;
   }).join('');
@@ -1345,7 +1398,7 @@ function renderChannelBadges(){
 function renderGoalBanner(){
   const banner=document.getElementById('goal-banner');
   if(!goal||!goal.target){
-    banner.innerHTML=`<div style="flex:1;color:var(--color-text-muted);font-size:var(--text-xs)">No goal set yet.</div><button class="btn-ghost" onclick="openGoalModal()" style="font-size:var(--text-xs)"><i data-lucide="target" style="width:14px;height:14px"></i> Set a Goal</button>`;
+    banner.innerHTML=`<div style="flex:1;color:var(--color-text-muted);font-size:var(--text-xs)">No goal set yet.</div>${isWorkspaceOwner()?`<button class="btn-ghost" onclick="openGoalModal()" style="font-size:var(--text-xs)"><i data-lucide="target" style="width:14px;height:14px"></i> Set a Goal</button>`:''}`;
     lucide.createIcons({nodes:[banner]});return;
   }
   const published=entries.filter(e=>e.status==='published').length;
@@ -1353,16 +1406,33 @@ function renderGoalBanner(){
   const remaining=Math.max(0,goal.target-published);
   let deadlineStr='';
   if(goal.deadline){const dl=new Date(goal.deadline+'T00:00:00');const days=Math.ceil((dl-today)/86400000);deadlineStr=days>0?`${days} days left`:days===0?'Due today!':'Past deadline';}
-  banner.innerHTML=`<div class="goal-banner-info"><div class="goal-banner-title"><i data-lucide="target" style="width:14px;height:14px;color:var(--color-primary)"></i>${escHtml(goal.name||'Content Goal')}<button class="goal-edit-btn" onclick="openGoalModal()"><i data-lucide="pencil" style="width:12px;height:12px"></i></button></div><div class="goal-banner-sub">${remaining>0?`${remaining} videos to go`:'🎉 Goal reached!'}</div></div><div class="goal-progress-wrap"><div class="goal-progress-top"><span class="goal-count">${published}</span><span class="goal-total">/ ${goal.target} videos · ${pct}%</span></div><div class="goal-bar-bg"><div class="goal-bar-fill${pct>=100?' over':''}" style="width:${pct}%"></div></div>${deadlineStr?`<div class="goal-deadline">${escHtml(deadlineStr)}</div>`:''}</div>`;
+  banner.innerHTML=`<div class="goal-banner-info"><div class="goal-banner-title"><i data-lucide="target" style="width:14px;height:14px;color:var(--color-primary)"></i>${escHtml(goal.name||'Content Goal')}${isWorkspaceOwner()?`<button class="goal-edit-btn" onclick="openGoalModal()"><i data-lucide="pencil" style="width:12px;height:12px"></i></button>`:''}</div><div class="goal-banner-sub">${remaining>0?`${remaining} videos to go`:'🎉 Goal reached!'}</div></div><div class="goal-progress-wrap"><div class="goal-progress-top"><span class="goal-count">${published}</span><span class="goal-total">/ ${goal.target} videos · ${pct}%</span></div><div class="goal-bar-bg"><div class="goal-bar-fill${pct>=100?' over':''}" style="width:${pct}%"></div></div>${deadlineStr?`<div class="goal-deadline">${escHtml(deadlineStr)}</div>`:''}</div>`;
   lucide.createIcons({nodes:[banner]});
 }
 function openGoalModal(){document.getElementById('g-name').value=goal.name||'';document.getElementById('g-target').value=goal.target||'';document.getElementById('g-deadline').value=goal.deadline||'';document.getElementById('goal-modal').classList.add('open');setTimeout(()=>document.getElementById('g-name').focus(),80);}
+function openPasswordModal(){
+  document.getElementById('user-menu-panel').classList.remove('open');
+  document.getElementById('pw-current').value='';document.getElementById('pw-new').value='';
+  document.getElementById('password-modal').classList.add('open');
+  setTimeout(()=>document.getElementById('pw-current').focus(),50);
+}
+function closePasswordModal(){document.getElementById('password-modal').classList.remove('open');}
+async function savePassword(ev){
+  ev.preventDefault();
+  const current_password=document.getElementById('pw-current').value;
+  const new_password=document.getElementById('pw-new').value;
+  return withBusy(document.getElementById('pw-save-btn'),async()=>{try{
+    await apiFetch('/api/me/password',{method:'POST',body:{current_password,new_password}});
+    closePasswordModal();
+    showToast('Password changed. Other devices were signed out.');
+  }catch(e){showToast(parseErr(e)||'Could not change password.','error');}});
+}
 function closeGoalModal(){document.getElementById('goal-modal').classList.remove('open');}
 async function saveGoal(){
   goal={name:document.getElementById('g-name').value.trim(),target:parseInt(document.getElementById('g-target').value)||0,deadline:document.getElementById('g-deadline').value};
   closeGoalModal();renderGoalBanner();render();
   try{await apiFetch('/api/goal',{method:'PUT',body:goal});showToast('Goal saved');}
-  catch(e){showToast('Failed to save goal — try again.','error');}
+  catch(e){showToast(parseErr(e)||'Failed to save goal — try again.','error');}
 }
 
 // ── Stats ──────────────────────────────────────────────────────────
@@ -1854,9 +1924,12 @@ function renderDiscussion(){
 // single pass over the escaped text so we never inject raw user input.
 function commentBodyHtml(body){
   const escaped=escHtml(body);
-  return escaped.replace(/(https?:\/\/[^\s<]+)/g,url=>{
-    const safe=safeUrl(url);
-    return safe?`<a href="${safe}" target="_blank" rel="noopener">${url}</a>`:url;
+  return escaped.replace(/(https?:\/\/[^\s<]+)/g,label=>{
+    // `label` is already escaped; decode it before safeUrl() escapes it for
+    // the href, or "&" would end up as a literal "&amp;" in the link.
+    const raw=label.replace(/&#39;/g,"'").replace(/&quot;/g,'"').replace(/&gt;/g,'>').replace(/&lt;/g,'<').replace(/&amp;/g,'&');
+    const safe=safeUrl(raw);
+    return safe?`<a href="${safe}" target="_blank" rel="noopener">${label}</a>`:label;
   });
 }
 
@@ -1880,7 +1953,7 @@ function renderCommentCard(c){
   if(isEditing){
     return `<div class="comment-card" data-id="${c.id}">
       <div class="comment-head">
-        <div class="user-avatar" style="width:20px;height:20px;font-size:10px">${userInitials(c.username)}</div>
+        <div class="user-avatar" style="width:20px;height:20px;font-size:10px">${escHtml(userInitials(c.username))}</div>
         <span class="comment-author">${escHtml(c.username||'')}</span>
         <span class="comment-meta">editing…</span>
       </div>
@@ -1900,7 +1973,7 @@ function renderCommentCard(c){
   </div>`:'';
   return `<div class="comment-card" data-id="${c.id}">
     <div class="comment-head">
-      <div class="user-avatar" style="width:20px;height:20px;font-size:10px">${userInitials(c.username)}</div>
+      <div class="user-avatar" style="width:20px;height:20px;font-size:10px">${escHtml(userInitials(c.username))}</div>
       <span class="comment-author">${escHtml(c.username||'')}</span>
       <span class="comment-meta">${escHtml(relativeTime(c.created_at))}${editedMark}</span>
       ${actions}
@@ -2203,7 +2276,7 @@ async function saveChannels(btn){
       showToast('Someone else changed channels — reloading…','error');
       await loadData();renderChannelSettings();
     }else{
-      showToast('Failed to save channels.','error');
+      showToast(parseErr(e)||'Failed to save channels.','error');
     }
   }});
 }
@@ -2225,7 +2298,7 @@ async function archiveChannel(i,btn){
     channels[i].archived=prev;
     const msg=parseErr(e);
     if(/modified by someone else/i.test(msg)){showToast('Someone else changed channels — reloading…','error');await loadData();renderChannelSettings();}
-    else showToast('Failed to archive channel.','error');
+    else showToast(parseErr(e)||'Failed to archive channel.','error');
   }});
 }
 async function unarchiveChannel(i,btn){
@@ -2245,7 +2318,7 @@ async function unarchiveChannel(i,btn){
     channels[i].archived=prev;
     const msg=parseErr(e);
     if(/modified by someone else/i.test(msg)){showToast('Someone else changed channels — reloading…','error');await loadData();renderChannelSettings();}
-    else showToast('Failed to unarchive channel.','error');
+    else showToast(parseErr(e)||'Failed to unarchive channel.','error');
   }});
 }
 async function removeChannel(i,btn){
@@ -2260,7 +2333,7 @@ async function removeChannel(i,btn){
     channelVisibility=channels.map((_,ci)=>channelVisibility[ci]!==false);
     renderChannelBadges();renderChannelSelects();renderChannelSettings();lucide.createIcons();render();
     showToast(`"${ch.name}" removed`);
-  }catch(e){showToast('Failed to remove channel.','error');}});
+  }catch(e){showToast(parseErr(e)||'Failed to remove channel.','error');}});
 }
 
 // ── CSV Export ─────────────────────────────────────────────────────
@@ -2269,7 +2342,10 @@ function exportCsv(){
   if(!entries.length){showToast('No videos to export.','error');return;}
   const headers=['title','date','channel','format','link','status','pillar','notes'];
   const esc=v=>{
-    const s=v==null?'':String(v);
+    let s=v==null?'':String(v);
+    // Spreadsheets run cells starting with = + - @ (or tab/CR) as formulas;
+    // a leading ' makes them plain text. Import strips it again.
+    if(/^[=+\-@\t\r]/.test(s))s="'"+s;
     return /[",\n\r]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;
   };
   const rows=[headers.join(',')];
@@ -2495,21 +2571,24 @@ function resolveChannel(csvName){
   return null;
 }
 
+// Undo exportCsv's formula guard ('=..., '+..., ...) so exports round-trip.
+function unFormula(v){return /^'[=+\-@\t\r]/.test(v)?v.slice(1):v;}
+
 function buildImportRows(){
   const cm=csvParsed.columnMapping;
   const validStatuses=['idea','filming','editing','ready','scheduled','published'];
   return csvParsed.parsed.rows.map(r=>{
-    const title=cm.title?(r[cm.title]||'').trim():'';
+    const title=cm.title?unFormula((r[cm.title]||'').trim()):'';
     const date=cm.date?normDate((r[cm.date]||'').trim()):'';
-    const channelName=cm.channel?(r[cm.channel]||'').trim():'';
+    const channelName=cm.channel?unFormula((r[cm.channel]||'').trim()):'';
     const chIdx=channelName?resolveChannel(channelName):null;
     const formatRaw=cm.format?(r[cm.format]||'').toLowerCase().trim():'';
     const fmt=formatRaw==='short'?'short':formatRaw==='long'?'long':'';
-    const link=cm.link?(r[cm.link]||'').trim():'';
+    const link=cm.link?unFormula((r[cm.link]||'').trim()):'';
     const statusRaw=cm.status?(r[cm.status]||'').toLowerCase().trim():'';
     const status=validStatuses.includes(statusRaw)?statusRaw:'published';
-    const pillar=cm.pillar?(r[cm.pillar]||'').trim():'';
-    const notes=cm.notes?(r[cm.notes]||'').trim():'';
+    const pillar=cm.pillar?unFormula((r[cm.pillar]||'').trim()):'';
+    const notes=cm.notes?unFormula((r[cm.notes]||'').trim()):'';
     // Date is only required when status demands it (Scheduled/Published).
     // Idea/Filming/Editing rows may legitimately have a blank date.
     const dateMissing=!date;
@@ -2598,19 +2677,30 @@ function toggleAllDuplicates(){
   renderImportStep('preview');
 }
 
-// Backend caps each bulk POST at 1000 rows. For larger imports we chunk
-// client-side and merge results so the user gets one consolidated report
-// instead of a 400 the moment they import their 1001st row.
-const BULK_IMPORT_CHUNK=1000;
+// Backend caps each bulk POST at 1000 rows and 2.5 MB (MAX_REQUEST_BYTES). We
+// chunk client-side by both row count and UTF-8 byte size (non-ASCII notes can
+// take 3-4 bytes per character) and merge results into one report.
+const BULK_IMPORT_MAX_ROWS=1000;
+const BULK_IMPORT_MAX_BYTES=2*1024*1024;
+function chunkBySize(rows){
+  const enc=new TextEncoder(),chunks=[];
+  let cur=[],size=2;  // "[]"
+  for(const r of rows){
+    const n=enc.encode(JSON.stringify(r)).length+1;  // +1 for the comma
+    if(cur.length&&(cur.length>=BULK_IMPORT_MAX_ROWS||size+n>BULK_IMPORT_MAX_BYTES)){chunks.push(cur);cur=[];size=2;}
+    cur.push(r);size+=n;
+  }
+  if(cur.length)chunks.push(cur);
+  return chunks;
+}
 async function doImport(){
   const allRows=buildImportRows();
   const rows=allRows.filter((r,i)=>!r._skip&&csvParsed.importChoices[i]);
   const btn=document.getElementById('do-import-btn');
   if(btn){btn.disabled=true;btn.classList.add('btn-busy');}
   const payload=rows.map(r=>({title:r.title,channel:r.channel,date:r.date,status:r.status,format:r.format,link:r.link,pillar:r.pillar,notes:r.notes}));
-  let ok=0,errs=[];
-  for(let start=0;start<payload.length;start+=BULK_IMPORT_CHUNK){
-    const chunk=payload.slice(start,start+BULK_IMPORT_CHUNK);
+  let ok=0,errs=[],start=0;
+  for(const chunk of chunkBySize(payload)){
     try{
       const resp=await apiFetch('/api/entries/bulk',{method:'POST',body:chunk});
       (resp.created||[]).forEach(e=>{entries.push(e);ok++;});
@@ -2620,6 +2710,7 @@ async function doImport(){
     }catch(e){
       errs.push({index:-1,detail:`Chunk starting at row ${start+1} failed: ${parseErr(e)||'unknown error'}`});
     }
+    start+=chunk.length;
   }
   closeImportModal();render();renderGoalBanner();
   if(errs.length===0){

@@ -1,5 +1,9 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Request, Response, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import ValidationError
+from starlette.requests import cookie_parser
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import SQLModel, Field, Column, JSON, create_engine, Session, select
@@ -7,7 +11,7 @@ from sqlalchemy import text, func
 from sqlalchemy.exc import IntegrityError
 from typing import Optional, List
 from datetime import date as _date, datetime, timedelta
-import json, os, pathlib, re, secrets, time
+import asyncio, hashlib, json, os, pathlib, re, secrets, time
 from collections import deque
 try:
     from zoneinfo import ZoneInfo, available_timezones  # py3.9+
@@ -19,7 +23,7 @@ except Exception:
         return set()
 
 import bcrypt as _bcrypt
-from itsdangerous import URLSafeSerializer, BadSignature
+from itsdangerous import URLSafeTimedSerializer, BadSignature
 
 # ── Validation constants / helpers ───────────────────────────────
 VALID_STATUSES = {"idea", "filming", "editing", "ready", "scheduled", "published"}
@@ -44,8 +48,11 @@ def _validate_icon(s: Optional[str]) -> str:
         return ""
     if len(s) > MAX_ICON_LEN:
         raise HTTPException(status_code=400, detail=f"Channel icon exceeds {MAX_ICON_LEN} bytes.")
-    if not (s.startswith("data:image/") or s.startswith("https://")):
-        raise HTTPException(status_code=400, detail="Channel icon must be a data:image/* or https:// URL.")
+    # Uploaded images only. A remote https:// icon would make every member's
+    # browser request it on each page load, letting whoever runs that server
+    # log their IPs and activity (a tracking pixel).
+    if not s.startswith("data:image/"):
+        raise HTTPException(status_code=400, detail="Channel icon must be an uploaded image (data:image/*).")
     # Forbid characters that could break out of an HTML attribute even if the
     # frontend forgets to escape (defense in depth).
     if any(ch in s for ch in ('"', "'", "<", ">", "\n", "\r")):
@@ -62,6 +69,19 @@ def _validate_format(s: Optional[str]) -> str:
     s = (s or "").strip()
     if s not in VALID_FORMATS:
         raise HTTPException(status_code=400, detail=f"Invalid format '{s}'.")
+    return s
+
+# New usernames are limited to a plain charset so they can never carry markup
+# or script into the UI. Existing accounts keep whatever name they have.
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{2,80}$")
+
+def _validate_username(s: str) -> str:
+    s = (s or "").strip()
+    if not USERNAME_RE.match(s):
+        raise HTTPException(
+            status_code=400,
+            detail="Username must be 2–80 characters: letters, numbers, '_', '.' or '-'.",
+        )
     return s
 
 def _validate_name(s: str, *, field: str, max_len: int = MAX_NAME_LEN) -> str:
@@ -89,11 +109,26 @@ SECRET_FILE = DATA_DIR / ".session_secret"
 # starting a fresh empty one (e.g. when the data volume isn't mounted where
 # expected). Leave it unset for a brand-new install's first run.
 REQUIRE_EXISTING_DB = os.getenv("REQUIRE_EXISTING_DB", "").strip().lower() in ("1", "true", "yes")
+
+# Sign-up needs an invite link unless ALLOW_OPEN_SIGNUP=1, so a server
+# reachable from the internet doesn't hand out accounts to anyone.
+ALLOW_OPEN_SIGNUP = os.getenv("ALLOW_OPEN_SIGNUP", "").strip().lower() in ("1", "true", "yes")
+
+# Mark the session cookie Secure (HTTPS-only). Turn on when the app is served
+# over HTTPS (reverse proxy, Tailscale Serve); leave off for plain-HTTP LAN use
+# or browsers will drop the cookie and nobody can log in.
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "").strip().lower() in ("1", "true", "yes")
 if REQUIRE_EXISTING_DB and not DB_FILE.is_file():
     raise RuntimeError(
         f"[fatal] REQUIRE_EXISTING_DB is set but no database exists at {DB_FILE}. "
         "Check that the data volume is mounted at DATA_DIR. Refusing to create an empty one."
     )
+# Files the app creates (calendar.db, its journal, .session_secret) are
+# readable only by the account the server runs as. They hold password hashes.
+try:
+    os.umask(0o077)
+except Exception:
+    pass
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 print(
     f"[init] DATA_DIR={DATA_DIR} DB_FILE={DB_FILE} "
@@ -117,47 +152,110 @@ def _load_or_create_secret() -> str:
         pass
     return s
 
-# Best-effort in-memory rate limiter. Used to throttle the public invite
-# preview endpoint so a script can't enumerate codes. Keyed by client IP;
-# resets on process restart, so behind a horizontal scaler put a real WAF
-# in front for stronger guarantees.
-_RATE_BUCKETS: dict = {}
-def _check_rate(key: str, *, max_hits: int, window_seconds: int) -> bool:
+# Best-effort in-memory rate limiter. Throttles the public invite preview (so
+# a script can't enumerate codes) and the auth endpoints (so passwords can't
+# be brute-forced). Limits live in this process and reset on restart, which is
+# one reason ContentCal must run as a single process (see the docs).
+#
+# Each bucket remembers its own window so housekeeping never drops history a
+# longer-window limiter still needs. A check with record=False only peeks and
+# never creates a bucket.
+_RATE_BUCKETS: dict = {}          # key -> [window_seconds, deque of hit times]
+_RATE_SWEEP_AT = 10_000           # sweep expired buckets once the dict passes this
+_RATE_MAX_KEYS = 100_000          # hard cap; oldest buckets are evicted beyond it
+
+def _check_rate(key: str, *, max_hits: int, window_seconds: int, record: bool = True) -> bool:
     now = time.monotonic()
-    bucket = _RATE_BUCKETS.get(key)
-    if bucket is None:
-        bucket = deque()
-        _RATE_BUCKETS[key] = bucket
-    cutoff = now - window_seconds
-    while bucket and bucket[0] < cutoff:
-        bucket.popleft()
-    if len(bucket) >= max_hits:
-        return False
-    bucket.append(now)
-    # Coarse housekeeping so the dict doesn't grow unbounded.
-    if len(_RATE_BUCKETS) > 10000:
-        for k in list(_RATE_BUCKETS.keys())[:5000]:
-            if not _RATE_BUCKETS[k] or _RATE_BUCKETS[k][-1] < cutoff:
-                _RATE_BUCKETS.pop(k, None)
+    entry = _RATE_BUCKETS.get(key)
+    if entry is not None:
+        bucket = entry[1]
+        cutoff = now - window_seconds
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= max_hits:
+            return False
+    if not record:
+        return True
+    if entry is None:
+        entry = [window_seconds, deque()]
+        _RATE_BUCKETS[key] = entry
+    entry[1].append(now)
+    if len(_RATE_BUCKETS) > _RATE_SWEEP_AT:
+        _sweep_rate_buckets(now)
     return True
 
+def _sweep_rate_buckets(now: float) -> None:
+    global _RATE_SWEEP_AT
+    for k in [k for k, (win, b) in _RATE_BUCKETS.items() if not b or b[-1] < now - win]:
+        del _RATE_BUCKETS[k]
+    # Still huge (a flood of distinct keys)? Evict the oldest-created buckets.
+    overflow = len(_RATE_BUCKETS) - _RATE_MAX_KEYS
+    if overflow > 0:
+        for k in list(_RATE_BUCKETS)[:overflow]:
+            del _RATE_BUCKETS[k]
+    # Sweep again only after the dict doubles, so sweeps stay amortized O(1).
+    _RATE_SWEEP_AT = max(10_000, 2 * len(_RATE_BUCKETS))
+
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
+    # Never read X-Forwarded-For here: any client can send it, which would let
+    # a script dodge the rate limits by inventing a new IP per request. Uvicorn
+    # already rewrites request.client from that header, but only for proxies
+    # listed in the FORWARDED_ALLOW_IPS env var (default 127.0.0.1).
     return request.client.host if request.client else "?"
 
+# Auth throttles. Brute force is stopped per account: failed logins are
+# counted per (exact username, client IP), plus a higher per-username cap for
+# clients that have never signed in to that account. A browser that has signed
+# in before carries a signed device cookie and gets its own bucket, so a
+# stranger hammering an account can't lock its owner out.
+#
+# The per-IP caps are deliberately generous: behind NAT, Docker Desktop, a
+# reverse proxy or Tailscale every user can share one IP, and these caps then
+# apply to all of them together.
+LOGIN_WINDOW_SECONDS = 15 * 60
+LOGIN_MAX_PER_IP = 100                # all login attempts per IP per window
+LOGIN_MAX_FAILS_PER_ACCOUNT_IP = 10   # failures per (username, IP) per window
+LOGIN_MAX_FAILS_PER_ACCOUNT = 50      # failures per username, all IPs (unknown devices only)
+LOGIN_MAX_FAILS_PER_DEVICE = 10       # failures per known device per window
+SIGNUP_MAX_PER_IP = 30                # account creations per IP per hour
+SETUP_MAX_PER_IP = 10                 # setup attempts per IP per window
+INVITE_PREVIEW_MAX_PER_IP = 60        # invite previews per IP per minute
+
+def _too_many(detail: str = "Too many attempts. Try again in a few minutes.") -> HTTPException:
+    return HTTPException(status_code=429, detail=detail)
+
 SESSION_SECRET = _load_or_create_secret()
-SESSION_COOKIE = "contentcal_session"
 SESSION_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 
-session_serializer = URLSafeSerializer(SESSION_SECRET, salt="session-v1")
+# Cookies are scoped by host, not port, so two ContentCal installs (or any
+# other app) on the same host would share one cookie name and log each other
+# out. The name carries a short tag derived from this install's secret. With
+# COOKIE_SECURE the __Host- prefix also pins the cookie to this exact origin.
+# Other apps on the same host still receive it; only a dedicated hostname per
+# app isolates it fully (see the README's security notes).
+_COOKIE_TAG = hashlib.sha256(b"contentcal-cookie-name:" + SESSION_SECRET.encode()).hexdigest()[:8]
+_COOKIE_PREFIX = "__Host-" if COOKIE_SECURE else ""
+SESSION_COOKIE = f"{_COOKIE_PREFIX}contentcal_session_{_COOKIE_TAG}"
+DEVICE_COOKIE = f"{_COOKIE_PREFIX}contentcal_device_{_COOKIE_TAG}"
+LEGACY_SESSION_COOKIE = "contentcal_session"  # name used before per-install names
+DEVICE_MAX_AGE = 60 * 60 * 24 * 365
+
+# Timed so the server, not just the browser, enforces SESSION_MAX_AGE. The salt
+# changed from v1, so cookies issued before this version are rejected and
+# everyone signs in once after upgrading.
+session_serializer = URLSafeTimedSerializer(SESSION_SECRET, salt="session-v2")
+# Marks a browser that has signed in to an account before (see the login throttles).
+device_serializer = URLSafeTimedSerializer(SESSION_SECRET, salt="device-v1")
 
 # bcrypt has a hard 72-byte input limit. Truncate (UTF-8 byte-safe) so longer
 # passphrases don't raise — common-enough that passlib also handles this.
 def hash_password(pw: str) -> str:
     pw_bytes = pw.encode("utf-8")[:72]
     return _bcrypt.hashpw(pw_bytes, _bcrypt.gensalt()).decode("utf-8")
+
+# Checked against when the username doesn't exist, so a login for a missing
+# account takes as long as a wrong password (no username probing by timing).
+_DUMMY_HASH = _bcrypt.hashpw(secrets.token_bytes(16), _bcrypt.gensalt()).decode("utf-8")
 
 def verify_password(pw: str, stored_hash: str) -> bool:
     try:
@@ -210,6 +308,9 @@ class User(SQLModel, table=True):
     password_hash: str
     default_workspace_id: int = 0
     created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    # Embedded in every session cookie. Bumping it (on logout) invalidates
+    # all of the user's existing cookies, including stolen copies.
+    session_version: int = 0
 
 class Workspace(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -298,6 +399,7 @@ class LoginIn(SQLModel):
 class SetupIn(SQLModel):
     username: str
     password: str
+    setup_code: str = ""
     workspace_name: Optional[str] = None  # defaults to "{username}'s Workspace"
 
 class WorkspaceIn(SQLModel):
@@ -308,6 +410,10 @@ class WorkspaceSettingsIn(SQLModel):
 
 class MemberRoleIn(SQLModel):
     role: str  # 'owner' | 'member'
+
+class PasswordChangeIn(SQLModel):
+    current_password: str
+    new_password: str
 
 class SwitchWorkspaceIn(SQLModel):
     workspace_id: int
@@ -334,7 +440,9 @@ def channel_dict(c: Channel) -> dict:
         "name": c.name,
         "pillars": c.pillars or [],
         "color": c.color or "",
-        "icon": c.icon or "",
+        # Remote icons saved before uploads-only are dropped here, so the next
+        # channel save clears them instead of failing validation.
+        "icon": c.icon if (c.icon or "").startswith("data:image/") else "",
         "archived": bool(c.archived),
     }
 
@@ -435,6 +543,12 @@ def _ensure_column(session: Session, table: str, column: str, ddl_type: str, def
 # ── Init / Migration ──────────────────────────────────────────────
 def init_db():
     SQLModel.metadata.create_all(engine)
+    # Databases created before the umask above may be world-readable; tighten
+    # them too. Best effort: some filesystems/OSes ignore chmod.
+    try:
+        os.chmod(DB_FILE, 0o600)
+    except Exception:
+        pass
     with Session(engine) as session:
         # Idempotent backfill of workspace_id columns on legacy DBs.
         _ensure_column(session, "channel", "workspace_id", "INTEGER", "0")
@@ -445,6 +559,7 @@ def init_db():
         _ensure_column(session, "workspace", "channels_version", "INTEGER", "0")
         _ensure_column(session, "workspace", "timezone", "TEXT", "''")
         _ensure_column(session, "workspacemember", "role", "TEXT", "'member'")
+        _ensure_column(session, "user", "session_version", "INTEGER", "0")
         # Promote each workspace's creator to owner if no owner is set yet.
         try:
             session.exec(text(
@@ -528,19 +643,40 @@ def _warn_on_orphan_zero_workspace() -> None:
                     "Migrate them into a real workspace or delete them."
                 )
 
+# One-time code required by first-run setup, so a stranger who reaches a fresh
+# install before its owner can't claim the admin account. Regenerated on every
+# start and printed to the server log (docker logs / Dockhand) while no
+# account exists.
+# SETUP_CODE can be set explicitly; otherwise it's random per start.
+SETUP_CODE = (os.getenv("SETUP_CODE", "").strip().upper() or secrets.token_hex(4).upper())
+
+def _print_setup_code_if_needed() -> None:
+    with Session(engine) as session:
+        if session.exec(select(User).limit(1)).first():
+            return
+    print(
+        f"[setup] No accounts yet. First-run setup code: {SETUP_CODE}\n"
+        "[setup] Enter it in the setup screen to create the admin account.",
+        flush=True,  # Docker block-buffers stdout; the code must reach the log now.
+    )
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     _warn_on_orphan_zero_workspace()
-    if not os.getenv("SESSION_SECRET"):
-        print(
-            "[warning] SESSION_SECRET env var not set — using the on-disk secret "
-            f"at {SECRET_FILE}. Multi-replica deployments MUST set SESSION_SECRET "
-            "or sessions will randomly 401 as requests round-robin between replicas."
-        )
+    _print_setup_code_if_needed()
     yield
 
-app = FastAPI(title="ContentCal API", lifespan=lifespan)
+# The interactive API docs are off unless ENABLE_API_DOCS=1: they publish a map
+# of every endpoint, and /docs loads Swagger UI from a third-party CDN.
+_API_DOCS = os.getenv("ENABLE_API_DOCS", "").strip().lower() in ("1", "true", "yes")
+app = FastAPI(
+    title="ContentCal API",
+    lifespan=lifespan,
+    docs_url="/docs" if _API_DOCS else None,
+    redoc_url="/redoc" if _API_DOCS else None,
+    openapi_url="/openapi.json" if _API_DOCS else None,
+)
 
 # CORS: frontend is served same-origin via StaticFiles, so by default we
 # disable cross-origin entirely. Set ALLOWED_ORIGINS (comma-separated) to
@@ -557,30 +693,248 @@ if _cors_origins:
         allow_headers=["*"],
     )
 
+# Request guard (H1). FastAPI reads and parses the whole JSON body before any
+# auth dependency runs, so without this an anonymous client can make the
+# server parse megabytes per request. Measured before this guard: 20
+# concurrent 5 MB bodies pushed memory to 4.6 GB. The guard, before any body
+# is read:
+#   - rejects /api/* requests that need a login but carry no validly signed
+#     session cookie (401), so anonymous bodies are never read;
+#   - caps the body per route: 16 KB for public endpoints, 256 KB for normal
+#     authenticated ones, MAX_REQUEST_BYTES (2.5 MB) only for the two bulk
+#     endpoints (channel save with six 300 KB icons; CSV import chunks);
+#   - lets at most two large bodies be processed at once.
+PUBLIC_BODY_BYTES = 16 * 1024
+DEFAULT_BODY_BYTES = 256 * 1024
+MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", str(int(2.5 * 1024 * 1024))))
+_LARGE_BODY_ROUTES = {("PUT", "/api/channels"), ("POST", "/api/entries/bulk")}
+_large_body_slots = asyncio.Semaphore(2)
+
+def _is_public_api(method: str, path: str) -> bool:
+    if path.startswith("/api/auth/") or path == "/api/timezones":
+        return True
+    # GET /api/invites/{code} (the invite preview on the join page).
+    return method == "GET" and re.fullmatch(r"/api/invites/[^/]+", path) is not None
+
+def _has_signed_session(scope) -> bool:
+    """Cheap pre-check: a session cookie with a valid signature and age. The
+    full check (account exists, session version) stays in current_user."""
+    for name, value in scope.get("headers", []):
+        if name == b"cookie":
+            raw = cookie_parser(value.decode("latin-1")).get(SESSION_COOKIE)
+            if raw:
+                try:
+                    session_serializer.loads(raw, max_age=SESSION_MAX_AGE)
+                    return True
+                except BadSignature:
+                    return False
+    return False
+
+class RequestGuardMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        method, path = scope["method"], scope["path"]
+        if path.startswith("/api/"):
+            if _is_public_api(method, path):
+                cap = PUBLIC_BODY_BYTES
+            else:
+                if not _has_signed_session(scope):
+                    return await _send_json(send, 401, {"detail": "Not authenticated"})
+                cap = MAX_REQUEST_BYTES if (method, path) in _LARGE_BODY_ROUTES else DEFAULT_BODY_BYTES
+        else:
+            cap = PUBLIC_BODY_BYTES  # static files never take a body
+        declared = None
+        for name, value in scope.get("headers", []):
+            if name == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = cap + 1
+        if declared is not None and declared > cap:
+            return await _send_json(send, 413, {"detail": "Request body too large."})
+        if declared is not None and declared <= DEFAULT_BODY_BYTES:
+            return await self.app(scope, receive, send)
+        # Large or undeclared length: take a slot, then (for chunked bodies)
+        # read at most `cap` bytes and replay them to the app.
+        async with _large_body_slots:
+            if declared is not None:
+                return await self.app(scope, receive, send)
+            chunks, size = [], 0
+            while True:
+                message = await receive()
+                if message["type"] != "http.request":
+                    break
+                size += len(message.get("body", b""))
+                if size > cap:
+                    return await _send_json(send, 413, {"detail": "Request body too large."})
+                chunks.append(message.get("body", b""))
+                if not message.get("more_body", False):
+                    break
+            replayed = False
+
+            async def replay_receive():
+                nonlocal replayed
+                if not replayed:
+                    replayed = True
+                    return {"type": "http.request", "body": b"".join(chunks), "more_body": False}
+                return await receive()
+
+            await self.app(scope, replay_receive, send)
+
+async def _send_json(send, status_code: int, payload: dict) -> None:
+    body = json.dumps(payload).encode()
+    await send({
+        "type": "http.response.start", "status": status_code,
+        "headers": [(b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode())],
+    })
+    await send({"type": "http.response.body", "body": body})
+
+app.add_middleware(RequestGuardMiddleware)
+
+# Validation errors never echo the request back (FastAPI's default 422 copies
+# each offending input into the response, which turned a 5 MB body into a
+# 5 MB reply) and are capped at 20 entries.
+def _validation_errors(errors) -> list:
+    return [{"loc": list(e.get("loc", ())), "msg": e.get("msg", ""), "type": e.get("type", "")}
+            for e in list(errors)[:20]]
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={"detail": _validation_errors(exc.errors())})
+
+async def _json_list_body(request: Request, max_items: int, label: str) -> list:
+    """Reads a JSON array body and checks its length *before* validating any
+    item, so a huge array can't make pydantic build one error per element."""
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be valid JSON.")
+    if not isinstance(data, list):
+        raise HTTPException(status_code=400, detail=f"Body must be a JSON array of {label}.")
+    if len(data) > max_items:
+        raise HTTPException(status_code=400, detail=f"Maximum {max_items} {label} supported per request.")
+    return data
+
+async def bulk_entries_body(request: Request) -> list:
+    return await _json_list_body(request, 1000, "rows")
+
+async def channels_body(request: Request) -> list:
+    return await _json_list_body(request, 6, "channels")
+
+# Browser hardening headers on every response. The CSP stops the page from
+# fetching, posting to or loading images/scripts/fonts from any other origin
+# (connect-src/img-src 'self'), which blocks the usual quiet ways injected
+# script would send data out. It can't stop top-level navigation
+# (location=, window.open), so it limits XSS rather than preventing exfiltration
+# outright. Inline script and styles stay allowed because the single-file
+# frontend relies on them. Strict-Transport-Security is only sent with
+# COOKIE_SECURE=1, i.e. when the operator says the app is served over HTTPS.
+CONTENT_SECURITY_POLICY = "; ".join([
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "font-src 'self'",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+])
+SECURITY_HEADERS = [
+    (b"x-content-type-options", b"nosniff"),
+    (b"x-frame-options", b"DENY"),
+    (b"referrer-policy", b"no-referrer"),
+    (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"),
+    (b"cross-origin-opener-policy", b"same-origin"),
+]
+if COOKIE_SECURE:
+    SECURITY_HEADERS.append((b"strict-transport-security", b"max-age=31536000"))
+# /docs and /redoc (only served with ENABLE_API_DOCS=1) load Swagger from a CDN.
+_CSP_EXEMPT_PATHS = ("/docs", "/redoc")
+
+class SecurityHeadersMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        csp = not (_API_DOCS and scope.get("path", "").startswith(_CSP_EXEMPT_PATHS))
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = [h for h in message.get("headers", []) if h[0].lower() not in {n for n, _ in SECURITY_HEADERS}]
+                headers += SECURITY_HEADERS
+                if csp:
+                    headers.append((b"content-security-policy", CONTENT_SECURITY_POLICY.encode()))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+app.add_middleware(SecurityHeadersMiddleware)
+
 # ── Session helpers ──────────────────────────────────────────────
-def _set_session_cookie(response: Response, user_id: int, active_workspace_id: int):
-    token = session_serializer.dumps({"uid": user_id, "wsid": active_workspace_id})
+def _set_session_cookie(response: Response, user: "User", active_workspace_id: int):
+    token = session_serializer.dumps({
+        "uid": user.id, "wsid": active_workspace_id, "sv": user.session_version or 0,
+    })
     response.set_cookie(
         SESSION_COOKIE,
         token,
         max_age=SESSION_MAX_AGE,
         httponly=True,
         samesite="lax",
-        secure=False,  # operator can put a TLS-terminating reverse proxy in front
+        secure=COOKIE_SECURE,
         path="/",
     )
+    # Drop the pre-upgrade cookie name; it's no longer valid anyway.
+    response.delete_cookie(LEGACY_SESSION_COOKIE, path="/")
 
 def _clear_session_cookie(response: Response):
-    response.delete_cookie(SESSION_COOKIE, path="/")
+    response.delete_cookie(SESSION_COOKIE, path="/", secure=COOKIE_SECURE, httponly=True, samesite="lax")
+
+def _set_device_cookie(response: Response, username: str):
+    token = device_serializer.dumps({"u": username, "d": secrets.token_urlsafe(16)})
+    response.set_cookie(
+        DEVICE_COOKIE, token, max_age=DEVICE_MAX_AGE,
+        httponly=True, samesite="lax", secure=COOKIE_SECURE, path="/",
+    )
+
+def _read_device(request: Request) -> Optional[dict]:
+    raw = request.cookies.get(DEVICE_COOKIE)
+    if not raw:
+        return None
+    try:
+        dev = device_serializer.loads(raw, max_age=DEVICE_MAX_AGE)
+    except BadSignature:
+        return None
+    return dev if isinstance(dev, dict) and "u" in dev and "d" in dev else None
 
 def _read_session(request: Request) -> Optional[dict]:
     raw = request.cookies.get(SESSION_COOKIE)
     if not raw:
         return None
     try:
-        return session_serializer.loads(raw)
+        # BadSignature also covers SignatureExpired (older than max_age).
+        sess = session_serializer.loads(raw, max_age=SESSION_MAX_AGE)
     except BadSignature:
         return None
+    return sess if isinstance(sess, dict) and "uid" in sess else None
+
+def _session_user(session: Session, sess: dict) -> Optional[User]:
+    """The cookie's user, or None if the account is gone or the cookie was
+    revoked (its session version no longer matches the user's)."""
+    u = session.get(User, sess["uid"])
+    if not u or sess.get("sv", -1) != (u.session_version or 0):
+        return None
+    return u
 
 # ── Auth dependencies ────────────────────────────────────────────
 def current_user(request: Request) -> User:
@@ -588,9 +942,9 @@ def current_user(request: Request) -> User:
     if not sess:
         raise HTTPException(status_code=401, detail="Not authenticated")
     with Session(engine) as session:
-        u = session.get(User, sess["uid"])
+        u = _session_user(session, sess)
         if not u:
-            raise HTTPException(status_code=401, detail="Account no longer exists")
+            raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
         return u
 
 def current_user_optional(request: Request) -> Optional[User]:
@@ -598,7 +952,7 @@ def current_user_optional(request: Request) -> Optional[User]:
     if not sess:
         return None
     with Session(engine) as session:
-        return session.get(User, sess["uid"])
+        return _session_user(session, sess)
 
 def current_workspace(request: Request, user: User = Depends(current_user)) -> Workspace:
     """Resolves the active workspace from the session cookie and verifies the
@@ -623,6 +977,13 @@ def current_workspace(request: Request, user: User = Depends(current_user)) -> W
         if not ws:
             raise HTTPException(status_code=409, detail="Workspace not found.")
         return ws
+
+def owner_workspace(ws: Workspace = Depends(current_workspace), user: User = Depends(current_user)) -> Workspace:
+    """current_workspace, restricted to owners. Used for structural changes
+    (channels, goal) that members shouldn't be able to make."""
+    with Session(engine) as session:
+        _require_owner(session, ws.id, user.id)
+    return ws
 
 def _user_workspaces(session: Session, user_id: int) -> List[Workspace]:
     member_rows = session.exec(select(WorkspaceMember).where(WorkspaceMember.user_id == user_id)).all()
@@ -715,14 +1076,21 @@ def setup_required():
     yet, the frontend shows the first-run setup wizard instead of /login."""
     with Session(engine) as session:
         has_users = session.exec(select(User).limit(1)).first() is not None
-        return {"setup_required": not has_users}
+        return {"setup_required": not has_users, "open_signup": ALLOW_OPEN_SIGNUP}
 
 @app.post("/api/auth/setup")
-def do_setup(payload: SetupIn, response: Response):
+def do_setup(payload: SetupIn, response: Response, request: Request):
     """One-time first-run setup. Creates the admin user, their workspace, and
     adopts any pre-existing workspace_id=0 data (legacy channels/entries/goal)
     into the new workspace. Refuses to run if any users already exist."""
-    username = _validate_name(payload.username, field="Username", max_len=80)
+    if not _check_rate(f"setup:{_client_ip(request)}", max_hits=SETUP_MAX_PER_IP, window_seconds=LOGIN_WINDOW_SECONDS):
+        raise _too_many()
+    if not secrets.compare_digest((payload.setup_code or "").strip().upper(), SETUP_CODE):
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid setup code. Find it in the server logs (e.g. docker logs contentcal).",
+        )
+    username = _validate_username(payload.username)
     if not payload.password:
         raise HTTPException(status_code=400, detail="Username and password are required.")
     if len(payload.password) < 8:
@@ -758,36 +1126,53 @@ def do_setup(payload: SetupIn, response: Response):
                 row.workspace_id = ws.id
                 session.add(row)
         session.commit()
-        _set_session_cookie(response, user.id, ws.id)
+        _set_session_cookie(response, user, ws.id)
+        _set_device_cookie(response, user.username)
         return {"user": user_dict(user), "workspace": workspace_dict(ws)}
 
 @app.post("/api/auth/signup")
-def signup(payload: SignupIn, response: Response):
-    """Open signup. Creates a user with their own personal workspace. If an
-    invite code is supplied, the user is also added to the invited workspace
-    and that becomes their default."""
-    username = _validate_name(payload.username, field="Username", max_len=80)
+def signup(payload: SignupIn, response: Response, request: Request):
+    """Creates a user with their own personal workspace. If an invite code is
+    supplied, the user is also added to the invited workspace and that becomes
+    their default. Unless ALLOW_OPEN_SIGNUP is set, a valid invite is required:
+    the account is only created if the invite can be claimed."""
+    if not _check_rate(f"signup:{_client_ip(request)}", max_hits=SIGNUP_MAX_PER_IP, window_seconds=3600):
+        raise _too_many("Too many sign-ups from this address. Try again later.")
+    if not ALLOW_OPEN_SIGNUP and not payload.invite_code:
+        raise HTTPException(
+            status_code=403,
+            detail="Sign-up is invite-only. Ask a workspace owner for an invite link.",
+        )
+    username = _validate_username(payload.username)
     if not payload.password:
         raise HTTPException(status_code=400, detail="Username and password are required.")
     if len(payload.password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
     with Session(engine) as session:
-        if session.exec(select(User).where(User.username == username)).first():
+        # In invite-only mode, check the invite before anything that depends on
+        # the username, so a bogus invite can't be used to probe which
+        # usernames exist (every bad invite gets the same 410). The atomic
+        # claim below still decides races.
+        if not ALLOW_OPEN_SIGNUP and not _invite_is_usable(session, payload.invite_code):
+            raise HTTPException(status_code=410, detail="That invite link is no longer valid.")
+        # Usernames are unique ignoring case, so nobody can register a
+        # look-alike ("Alice" next to "alice"). Login itself stays exact-match.
+        if session.exec(select(User).where(func.lower(User.username) == username.lower())).first():
             raise HTTPException(status_code=400, detail="Username is already taken.")
+        # Everything below is one transaction (flush, not commit) so an invite
+        # that can't be claimed in invite-only mode leaves no account behind.
         user = User(username=username, password_hash=hash_password(payload.password))
         session.add(user)
         try:
-            session.commit()
+            session.flush()
         except IntegrityError:
             # Raced with another signup with the same username.
             session.rollback()
             raise HTTPException(status_code=400, detail="Username is already taken.")
-        session.refresh(user)
         # Personal workspace — user is the owner.
         personal = Workspace(name=f"{username}'s Workspace", created_by_user_id=user.id)
         session.add(personal)
-        session.commit()
-        session.refresh(personal)
+        session.flush()
         session.add(WorkspaceMember(workspace_id=personal.id, user_id=user.id, role="owner"))
         for i, ch in enumerate(DEFAULT_CHANNELS):
             session.add(Channel(workspace_id=personal.id, position=i, name=ch["name"], pillars=ch["pillars"]))
@@ -808,16 +1193,53 @@ def signup(payload: SignupIn, response: Response):
                     session.add(WorkspaceMember(workspace_id=invite.workspace_id, user_id=user.id, role="member"))
                     user.default_workspace_id = invite.workspace_id
                     active_ws_id = invite.workspace_id
+            elif not ALLOW_OPEN_SIGNUP:
+                session.rollback()
+                raise HTTPException(status_code=410, detail="That invite link is no longer valid.")
         session.add(user)
         session.commit()
-        _set_session_cookie(response, user.id, active_ws_id)
+        _set_session_cookie(response, user, active_ws_id)
+        _set_device_cookie(response, user.username)
         return {"user": user_dict(user)}
 
+def _invite_is_usable(session: Session, code: Optional[str]) -> bool:
+    if not code:
+        return False
+    inv = session.exec(select(WorkspaceInvite).where(WorkspaceInvite.code == code)).first()
+    return bool(
+        inv and inv.used_by_user_id is None and inv.revoked_at is None
+        and (inv.expires_at is None or inv.expires_at > datetime.utcnow().isoformat())
+    )
+
+def _login_failure_limits(request: Request, username: str) -> list:
+    """(key, max failures) pairs that apply to this login attempt. Keys use the
+    exact username, the same way the account is looked up, so failures against
+    "ALICE" never count against "alice"."""
+    device = _read_device(request)
+    if device and device["u"] == username:
+        # A browser that signed in to this account before: its own bucket, so
+        # strangers' failures can't lock it out.
+        return [(f"login-dev:{device['d']}", LOGIN_MAX_FAILS_PER_DEVICE)]
+    return [
+        (f"login-acct-ip:{username}|{_client_ip(request)}", LOGIN_MAX_FAILS_PER_ACCOUNT_IP),
+        (f"login-acct:{username}", LOGIN_MAX_FAILS_PER_ACCOUNT),
+    ]
+
 @app.post("/api/auth/login")
-def login(payload: LoginIn, response: Response):
+def login(payload: LoginIn, response: Response, request: Request):
+    username = (payload.username or "").strip()
+    if not _check_rate(f"login-ip:{_client_ip(request)}", max_hits=LOGIN_MAX_PER_IP, window_seconds=LOGIN_WINDOW_SECONDS):
+        raise _too_many()
+    limits = _login_failure_limits(request, username)
+    for key, cap in limits:
+        if not _check_rate(key, max_hits=cap, window_seconds=LOGIN_WINDOW_SECONDS, record=False):
+            raise _too_many()
     with Session(engine) as session:
-        user = session.exec(select(User).where(User.username == payload.username.strip())).first()
-        if not user or not verify_password(payload.password, user.password_hash):
+        user = session.exec(select(User).where(User.username == username)).first()
+        if not verify_password(payload.password, user.password_hash if user else _DUMMY_HASH) or not user:
+            # Only failures count toward the per-account caps.
+            for key, cap in limits:
+                _check_rate(key, max_hits=cap, window_seconds=LOGIN_WINDOW_SECONDS)
             raise HTTPException(status_code=401, detail="Invalid username or password.")
         # Pick active workspace = default, falling back to first membership
         active_ws = user.default_workspace_id
@@ -827,11 +1249,22 @@ def login(payload: LoginIn, response: Response):
                 active_ws = first.workspace_id
         if not active_ws:
             raise HTTPException(status_code=500, detail="No workspace available for this account. Contact an admin.")
-        _set_session_cookie(response, user.id, active_ws)
+        _set_session_cookie(response, user, active_ws)
+        _set_device_cookie(response, user.username)
         return {"user": user_dict(user), "active_workspace_id": active_ws}
 
 @app.post("/api/auth/logout")
-def logout(response: Response):
+def logout(request: Request, response: Response):
+    """Revokes every session cookie for this account (all devices), not just
+    the one in this browser, so a copied cookie stops working too."""
+    sess = _read_session(request)
+    if sess:
+        with Session(engine) as session:
+            u = _session_user(session, sess)
+            if u:
+                u.session_version = (u.session_version or 0) + 1
+                session.add(u)
+                session.commit()
     _clear_session_cookie(response)
     return {"ok": True}
 
@@ -839,12 +1272,40 @@ def logout(response: Response):
 def me(request: Request, user: User = Depends(current_user)):
     with Session(engine) as session:
         wss = _user_workspaces(session, user.id)
+        roles = {
+            m.workspace_id: m.role
+            for m in session.exec(select(WorkspaceMember).where(WorkspaceMember.user_id == user.id)).all()
+        }
         sess = _read_session(request) or {}
         return {
             "user": user_dict(user),
-            "workspaces": [workspace_dict(w) for w in wss],
+            "workspaces": [{**workspace_dict(w), "role": roles.get(w.id, "member")} for w in wss],
             "active_workspace_id": sess.get("wsid") or user.default_workspace_id,
         }
+
+@app.post("/api/me/password")
+def change_password(payload: PasswordChangeIn, request: Request, response: Response, user: User = Depends(current_user)):
+    """Changes the password (the current one is required) and signs the
+    account out everywhere else: session_version is bumped and only this
+    browser gets a fresh cookie."""
+    fail_key = f"pwchange:{user.id}"
+    if not _check_rate(fail_key, max_hits=LOGIN_MAX_FAILS_PER_DEVICE, window_seconds=LOGIN_WINDOW_SECONDS, record=False):
+        raise _too_many()
+    if len(payload.new_password or "") < 8:
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters.")
+    with Session(engine) as session:
+        u = session.get(User, user.id)
+        if not u or not verify_password(payload.current_password or "", u.password_hash):
+            _check_rate(fail_key, max_hits=LOGIN_MAX_FAILS_PER_DEVICE, window_seconds=LOGIN_WINDOW_SECONDS)
+            raise HTTPException(status_code=403, detail="Current password is incorrect.")
+        u.password_hash = hash_password(payload.new_password)
+        u.session_version = (u.session_version or 0) + 1
+        session.add(u)
+        session.commit()
+        session.refresh(u)
+        sess = _read_session(request) or {}
+        _set_session_cookie(response, u, sess.get("wsid") or u.default_workspace_id)
+        return {"ok": True}
 
 @app.put("/api/me/active-workspace")
 def switch_workspace(payload: SwitchWorkspaceIn, response: Response, request: Request, user: User = Depends(current_user)):
@@ -859,7 +1320,7 @@ def switch_workspace(payload: SwitchWorkspaceIn, response: Response, request: Re
             u.default_workspace_id = payload.workspace_id
             session.add(u)
             session.commit()
-        _set_session_cookie(response, user.id, payload.workspace_id)
+        _set_session_cookie(response, user, payload.workspace_id)
         return {"ok": True, "active_workspace_id": payload.workspace_id}
 
 # ────────────────────────────────────────────────────────────────────
@@ -879,8 +1340,8 @@ def create_workspace(payload: WorkspaceIn, response: Response, user: User = Depe
             session.add(Channel(workspace_id=ws.id, position=i, name=ch["name"], pillars=ch["pillars"]))
         session.commit()
         # Switch the user into the new workspace immediately
-        _set_session_cookie(response, user.id, ws.id)
-        return workspace_dict(ws)
+        _set_session_cookie(response, user, ws.id)
+        return {**workspace_dict(ws), "role": "owner"}
 
 @app.put("/api/workspaces/{workspace_id}")
 def rename_workspace(workspace_id: int, payload: WorkspaceIn, user: User = Depends(current_user)):
@@ -1008,7 +1469,7 @@ def remove_member(workspace_id: int, member_user_id: int, response: Response, re
                 user.default_workspace_id = remaining.workspace_id
                 session.add(user)
                 session.commit()
-                _set_session_cookie(response, user.id, remaining.workspace_id)
+                _set_session_cookie(response, user, remaining.workspace_id)
             else:
                 _clear_session_cookie(response)
         return {"ok": True}
@@ -1074,6 +1535,10 @@ def list_invites(workspace_id: int, user: User = Depends(current_user)):
     with Session(engine) as session:
         if not _is_member(session, workspace_id, user.id):
             raise HTTPException(status_code=403, detail="Not a member of this workspace.")
+        # Invites are owner-only: members get an empty list (not a 403, so the
+        # settings panel still loads for them) and can't pass links around.
+        if not _is_owner(session, workspace_id, user.id):
+            return []
         rows = session.exec(select(WorkspaceInvite).where(WorkspaceInvite.workspace_id == workspace_id)).all()
         ws = session.get(Workspace, workspace_id)
         ws_name = ws.name if ws else ""
@@ -1097,7 +1562,7 @@ def preview_invite(code: str, request: Request):
     """Public — lets the signup/join page show which workspace the invite
     belongs to before the user commits. Does NOT consume the invite.
     Rate-limited per IP to make code enumeration infeasible."""
-    if not _check_rate(f"invite:{_client_ip(request)}", max_hits=20, window_seconds=60):
+    if not _check_rate(f"invite:{_client_ip(request)}", max_hits=INVITE_PREVIEW_MAX_PER_IP, window_seconds=60):
         raise HTTPException(status_code=429, detail="Too many invite lookups. Try again in a minute.")
     with Session(engine) as session:
         inv = session.exec(select(WorkspaceInvite).where(WorkspaceInvite.code == code)).first()
@@ -1134,7 +1599,7 @@ def accept_invite(code: str, response: Response, user: User = Depends(current_us
             raise HTTPException(status_code=410, detail="Invite not valid.")
         session.add(WorkspaceMember(workspace_id=inv.workspace_id, user_id=user.id, role="member"))
         session.commit()
-        _set_session_cookie(response, user.id, inv.workspace_id)
+        _set_session_cookie(response, user, inv.workspace_id)
         ws = session.get(Workspace, inv.workspace_id)
         return {"ok": True, "workspace": workspace_dict(ws) if ws else None}
 
@@ -1184,7 +1649,7 @@ def _validate_entry_payload(session: Session, ws_id: int, entry: "EntryIn") -> d
     }
 
 @app.get("/api/data")
-def get_data(ws: Workspace = Depends(current_workspace)):
+def get_data(ws: Workspace = Depends(current_workspace), user: User = Depends(current_user)):
     with Session(engine) as session:
         auto_publish_past_scheduled(session, ws.id)
         channels = session.exec(
@@ -1215,10 +1680,12 @@ def get_data(ws: Workspace = Depends(current_workspace)):
             "goal": goal_dict(goal),
             "channels_version": ws.channels_version,
             "workspace_id": ws.id,
+            # Lets open tabs notice role changes made by another owner.
+            "role": "owner" if _is_owner(session, ws.id, user.id) else "member",
         }
 
 @app.put("/api/goal")
-def update_goal(goal_in: GoalIn, ws: Workspace = Depends(current_workspace)):
+def update_goal(goal_in: GoalIn, ws: Workspace = Depends(owner_workspace)):
     name = _validate_text(goal_in.name or "", field="Goal name", max_len=MAX_NAME_LEN)
     deadline = (goal_in.deadline or "").strip()
     if deadline:
@@ -1254,30 +1721,36 @@ def add_entry(entry: EntryIn, ws: Workspace = Depends(current_workspace)):
         return entry_dict(new_e)
 
 @app.post("/api/entries/bulk")
-def add_entries_bulk(entries: List[EntryIn], ws: Workspace = Depends(current_workspace)):
+def add_entries_bulk(rows: list = Depends(bulk_entries_body), ws: Workspace = Depends(current_workspace)):
     """Atomic-per-row bulk insert used by the CSV import. Returns a
     per-row result list so the client can surface exactly which rows failed
-    and why, instead of swallowing failures one HTTP call at a time."""
-    if not entries:
-        return {"created": [], "errors": []}
-    if len(entries) > 1000:
-        raise HTTPException(status_code=400, detail="Bulk import is limited to 1000 rows per request.")
+    and why, instead of swallowing failures one HTTP call at a time. Rows are
+    validated one at a time (the array length was checked first), and each
+    insert runs in its own SAVEPOINT so a failing row never undoes earlier
+    ones."""
     created = []
     errors = []
     with Session(engine) as session:
-        for i, entry in enumerate(entries):
+        for i, row in enumerate(rows):
             try:
+                entry = EntryIn.model_validate(row)
                 v = _validate_entry_payload(session, ws.id, entry)
+            except ValidationError as exc:
+                first = exc.errors()[0] if exc.errors() else {}
+                field = ".".join(str(x) for x in first.get("loc", ())) or "row"
+                errors.append({"index": i, "detail": f"{field}: {first.get('msg', 'invalid')}"})
+                continue
             except HTTPException as exc:
                 errors.append({"index": i, "detail": str(exc.detail)})
                 continue
             new_e = Entry(workspace_id=ws.id, **v)
-            session.add(new_e)
             try:
-                session.flush()
+                with session.begin_nested():
+                    session.add(new_e)
             except Exception as exc:
-                session.rollback()
-                errors.append({"index": i, "detail": f"Database error: {exc!s}"})
+                # Log the details server-side; don't echo DB internals to clients.
+                print(f"[bulk-import] row {i} failed: {exc!r}")
+                errors.append({"index": i, "detail": "Could not save this row."})
                 continue
             created.append(entry_dict(new_e))
         session.commit()
@@ -1421,17 +1894,19 @@ def delete_comment(comment_id: int, ws: Workspace = Depends(current_workspace), 
         return {"ok": True}
 
 @app.put("/api/channels")
-def update_channels(channels_in: List[ChannelIn], request: Request, ws: Workspace = Depends(current_workspace)):
-    if not channels_in:
+def update_channels(request: Request, raw_channels: list = Depends(channels_body), ws: Workspace = Depends(owner_workspace)):
+    if not raw_channels:
         raise HTTPException(status_code=400, detail="At least one channel is required.")
-    if len(channels_in) > 6:
-        raise HTTPException(status_code=400, detail="Maximum 6 channels supported.")
+    try:
+        channels_in = [ChannelIn.model_validate(c) for c in raw_channels]
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=_validation_errors(exc.errors()))
     # Validate each channel before touching the DB.
     validated = []
     for ch_in in channels_in:
         validated.append({
             "name": _validate_name(ch_in.name, field="Channel name", max_len=80),
-            "pillars": [_validate_name(p, field="Pillar", max_len=80) for p in (ch_in.pillars or [])][:20],
+            "pillars": [_validate_name(p, field="Pillar", max_len=80) for p in (ch_in.pillars or [])[:20]],
             "color": _validate_color(ch_in.color),
             "icon": _validate_icon(ch_in.icon),
             "archived": bool(ch_in.archived),
@@ -1498,7 +1973,7 @@ def update_channels(channels_in: List[ChannelIn], request: Request, ws: Workspac
         }
 
 @app.delete("/api/channels/{channel_index}")
-def delete_channel(channel_index: int, ws: Workspace = Depends(current_workspace)):
+def delete_channel(channel_index: int, ws: Workspace = Depends(owner_workspace)):
     with Session(engine) as session:
         channels = session.exec(
             select(Channel).where(Channel.workspace_id == ws.id).order_by(Channel.position)

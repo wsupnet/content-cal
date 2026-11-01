@@ -38,8 +38,9 @@ When you open ContentCal you'll see a login screen. Enter your username and pass
 
 ![Login screen](screenshots/01_login.png)
 
-- **First time the app is ever opened?** You'll instead see a short setup screen to create the very first account — that account becomes the admin.
-- **Need an account?** Click **Sign up**, or use an invite link a teammate sent you.
+- **First time the app is ever opened?** You'll instead see a short setup screen to create the very first account — that account becomes the admin. It asks for a **setup code**, which whoever runs the server finds in its logs (`docker logs contentcal`).
+- **Need an account?** Ask a workspace owner for an invite link and open it — that takes you to sign-up. (If your server has open sign-up turned on, there's also a **Sign up** link on the login screen.)
+- **Change your password** from the account menu (your initials, top right). Every other device is signed out.
 
 ---
 
@@ -132,7 +133,7 @@ Zoomed-out roll-ups. The **Year** view shows each month's count and a progress b
 
 ## 7. Setting up your channels
 
-Click the **settings (⚙︎) icon** in the top bar to open **Manage Channels**.
+Click the **settings (⚙︎) icon** in the top bar to open **Manage Channels**. Only workspace owners can manage channels, so members don't see this button.
 
 ![Manage channels](screenshots/10_manage_channels.png)
 
@@ -149,7 +150,7 @@ Click **Save Channel Changes** when you're done.
 
 ## 8. Setting a goal
 
-A goal keeps you honest. Click the **pencil** next to the goal banner (or **Set a Goal** if you haven't yet) and enter:
+A goal keeps you honest (owners only). Click the **pencil** next to the goal banner (or **Set a Goal** if you haven't yet) and enter:
 
 - **Goal name** — e.g. "1 Video/Week per channel".
 - **Target** — the number of published videos you're aiming for.

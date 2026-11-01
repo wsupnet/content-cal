@@ -9,21 +9,13 @@ set -e
 
 cd "$(git rev-parse --show-toplevel)"
 
-# Fail clearly if dev deps are missing, instead of letting pytest produce
-# a less-useful ImportError further down.
-# Pick whichever Python interpreter is on PATH. macOS provides `python3` but
-# not `python`; Linux distros / virtualenvs commonly have both.
-if command -v python3 >/dev/null 2>&1; then
-  PY=python3
-elif command -v python >/dev/null 2>&1; then
-  PY=python
-else
-  echo "✗ No python interpreter found on PATH."
+# Tests run in Docker (see `make test`), so Docker is the only requirement.
+if ! command -v docker >/dev/null 2>&1; then
+  echo "✗ Docker is not installed or not on PATH. It's needed to run the test suite."
   exit 1
 fi
-
-if ! $PY -c "import pytest" >/dev/null 2>&1; then
-  echo "✗ pytest is not installed for $PY. Run 'make setup' once, then push again."
+if ! docker info >/dev/null 2>&1; then
+  echo "✗ Docker isn't running. Start Docker Desktop (or the Docker service), then push again."
   exit 1
 fi
 

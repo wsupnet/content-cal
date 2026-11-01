@@ -75,12 +75,70 @@ Navigate to: `http://<your-nas-ip>:8765`
 Via Tailscale: `http://<nas-tailscale-ip>:8765`
 
 The **first** person to open the app runs a one-time setup wizard that creates
-the admin account and the first workspace. After that, sign in with your
-account; invite teammates from **Workspace settings**.
+the admin account and the first workspace. The wizard asks for a **setup
+code**, which the server prints to its log on startup so a stranger can't claim
+your install first:
 
-> ⚠️ Cookies are sent without the `Secure` flag, so terminate TLS at a reverse
-> proxy (or use Tailscale) when exposing this beyond localhost. For multi-replica
-> deployments you must set the `SESSION_SECRET` env var.
+```bash
+docker logs contentcal 2>&1 | grep "setup code"
+```
+
+(In Dockhand, open the container's logs.) The code changes on every restart
+until setup is done. After that, sign in with your account; invite teammates
+from **Workspace settings**. Sign-up is **invite-only**: people join through an
+invite link (set `ALLOW_OPEN_SIGNUP=1` in `docker-compose.yml` to open it).
+
+> ⚠️ Plain `http://` sends logins unencrypted, so use HTTPS (a reverse proxy or
+> Tailscale) when exposing this beyond your home network, and then set
+> `COOKIE_SECURE=1`. See [Security notes](#security-notes) before exposing it
+> to the internet.
+>
+> The container runs as root unless you uncomment the `user:` line in
+> `docker-compose.yml` (instructions are next to it).
+
+---
+
+## Configuration
+
+All settings are environment variables in `docker-compose.yml` (most are there,
+commented out, with notes):
+
+| Variable | Default | What it does |
+|---|---|---|
+| `APPDATA` (in `.env`) | _(required)_ | Host folder holding `contentcal/calendar.db` |
+| `REQUIRE_EXISTING_DB` | `1` in compose | Refuse to start without an existing database |
+| `ALLOW_OPEN_SIGNUP` | off | `1` lets anyone create an account; otherwise invite-only |
+| `COOKIE_SECURE` | off | `1` when served over HTTPS: HTTPS-only cookie + HSTS |
+| `FORWARDED_ALLOW_IPS` | `127.0.0.1` | Your reverse proxy's IP/subnet, so each user gets their own rate limits. Only set it when **every** request goes through the proxy (see the compose file) |
+| `MAX_REQUEST_BYTES` | 2.5 MB | Largest channel save / CSV import chunk |
+| `SETUP_CODE` | random per start | Fixed first-run setup code, if you'd rather set one |
+| `SESSION_SECRET` | generated in the data folder | Signs login cookies; changing it signs everyone out |
+| `ENABLE_API_DOCS` | off | `1` serves `/docs` (development only; loads from a CDN) |
+
+---
+
+## Security notes
+
+- **One process, one container.** Login limits and the setup code live in
+  memory, so run a single container with a single uvicorn process. Multiple
+  workers or replicas aren't supported.
+- **Give each app its own hostname** when exposing it. Browsers share cookies
+  between every port on the same host, so other web apps on your NAS's IP
+  receive ContentCal's login cookie too. Serving ContentCal on its own name
+  (e.g. `calendar.example.com` through a reverse proxy, with
+  `COOKIE_SECURE=1`) is the only way to keep it to itself. The cookie name is
+  unique per install, so two ContentCal installs on one host no longer log each
+  other out.
+- **Reverse proxies:** set `FORWARDED_ALLOW_IPS` as described in the compose
+  file, or every user shares one rate-limit bucket. Never trust an IP that
+  other machines can also connect from.
+- **Shared IPs** (NAT, Docker Desktop, Tailscale Serve): all users behind one IP
+  share the per-IP limits, which are set generously for that reason. Login
+  lockouts are per account and IP, and a browser that has signed in before
+  keeps its own allowance, so a stranger can't lock you out of your account.
+- The content security policy blocks the page from fetching or loading
+  anything from other servers. It can't stop a page from navigating away, so
+  it limits the damage of a script-injection bug rather than ruling it out.
 
 ---
 
@@ -129,6 +187,11 @@ Back this up with your normal NAS backup routine (rsync, Hyper Backup, etc.).
 The same folder also holds a `.session_secret` file; preserving it keeps users
 logged in across restarts.
 
+Both files are readable only by the account the container runs as (root by
+default) because they hold password hashes and the session key. Run backups as
+an admin, or set the compose `user:` line to your own account so the files are
+yours.
+
 ---
 
 ## Port
@@ -155,21 +218,22 @@ The core data routes (all scoped to your active workspace via the session cookie
 
 There are many more routes for auth, workspaces, members, invites, and comments.
 See the **[full API reference](docs/DEVELOPER_GUIDE.md#15-api-reference)** in the
-Developer Guide, or the interactive OpenAPI docs at:
-
-Interactive API docs: `http://<your-ip>:8765/docs`
+Developer Guide. Interactive OpenAPI docs (`/docs`) are off unless you set
+`ENABLE_API_DOCS=1`.
 
 ---
 
 ## Development
 
-The backend has a pytest regression suite (~80 tests, ~30s). Common dev tasks
-are wrapped in a top-level `Makefile`:
+The backend has a pytest regression suite (~110 tests, ~60s). It runs inside
+the app's Docker image, so the only requirement is Docker, on any OS. Common
+dev tasks are wrapped in a top-level `Makefile`:
 
 ```bash
 make help            # list all targets
-make setup           # one-time: install dev deps + wire up the pre-push hook
-make test            # run the regression suite
+make setup           # one-time: build the test image + wire up the pre-push hook
+make test            # run the regression suite (in Docker)
+make test-local      # run it on your own Python 3.11+ instead
 make install-hooks   # (re-)wire the pre-push hook on a fresh clone
 ```
 

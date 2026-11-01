@@ -26,6 +26,8 @@ _FRONTEND_STUB.mkdir(parents=True, exist_ok=True)
 os.environ["DATA_DIR"] = str(_DATA_DIR)
 os.environ.pop("REQUIRE_EXISTING_DB", None)
 os.environ["SESSION_SECRET"] = "test-secret-do-not-use-anywhere-real"
+# Most tests create standalone accounts; invite-only mode has its own tests.
+os.environ["ALLOW_OPEN_SIGNUP"] = "1"
 
 # Patch StaticFiles so the hardcoded "/frontend" directory in main.py doesn't
 # crash at import time on a dev box.
@@ -87,7 +89,7 @@ DEFAULT_PW = "password123"
 
 def do_setup(c: TestClient, username: str = "alice", password: str = DEFAULT_PW,
              workspace_name: str | None = None) -> dict:
-    payload = {"username": username, "password": password}
+    payload = {"username": username, "password": password, "setup_code": main.SETUP_CODE}
     if workspace_name:
         payload["workspace_name"] = workspace_name
     r = c.post("/api/auth/setup", json=payload)

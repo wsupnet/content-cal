@@ -5,6 +5,11 @@ services:
     build: ./backend
     container_name: contentcal
     restart: unless-stopped
+    # Run as your own account instead of root (recommended). Use the output of
+    # `id -u` and `id -g`, and first give that account the data folder:
+    #   sudo chown -R 1000:1000 "$APPDATA/contentcal"
+    # Left commented so existing installs (whose files root owns) keep working.
+    # user: "1000:1000"
     ports:
       - "8765:8000"          # Change 8765 to any port you want
     volumes:
@@ -18,6 +23,26 @@ services:
       # Refuse to start if $APPDATA/contentcal/calendar.db is missing instead of
       # creating an empty one. Comment out for a brand-new install's very first run.
       - REQUIRE_EXISTING_DB=1
+      # Behind a reverse proxy (Caddy, nginx, Traefik…)? Without this, uvicorn
+      # sees every user as the proxy's IP, so all users share one rate-limit
+      # bucket. Trust ONLY the proxy, and only when every request goes through
+      # it:
+      #   - proxy in this compose network: remove the `ports:` mapping above
+      #     and set this to the proxy container's IP or subnet (CIDR works);
+      #   - proxy on the host: publish as "127.0.0.1:8765:8000" so only the host
+      #     can connect, then set this to the Docker gateway IP.
+      # Never trust the gateway while the port is reachable from the network:
+      # anyone could then fake their IP with an X-Forwarded-For header.
+      # - FORWARDED_ALLOW_IPS=172.18.0.10
+      # Largest body for channel saves / CSV import chunks (default 2.5 MB).
+      # Other requests are capped lower in code (256 KB; 16 KB when logged out).
+      # - MAX_REQUEST_BYTES=2621440
+      # Serving over HTTPS (reverse proxy, Tailscale Serve)? Mark the login
+      # cookie HTTPS-only. Don't set it for plain http:// or logins will fail.
+      # - COOKIE_SECURE=1
+      # Sign-up is invite-only by default. Set to 1 to let anyone who can reach
+      # the server create an account.
+      # - ALLOW_OPEN_SIGNUP=1
 
 networks:
   default:

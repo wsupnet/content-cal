@@ -1,16 +1,17 @@
+import main
 from conftest import do_setup, do_signup, do_login, me, DEFAULT_PW
 
 
 def test_setup_required_true_on_empty_db(client):
     r = client.get("/api/auth/setup-required")
     assert r.status_code == 200
-    assert r.json() == {"setup_required": True}
+    assert r.json()["setup_required"] is True
 
 
 def test_setup_required_false_after_setup(client):
     do_setup(client)
     r = client.get("/api/auth/setup-required")
-    assert r.json() == {"setup_required": False}
+    assert r.json()["setup_required"] is False
 
 
 def test_setup_creates_user_workspace_and_session(client):
@@ -25,7 +26,7 @@ def test_setup_creates_user_workspace_and_session(client):
 
 def test_setup_refuses_second_run(client):
     do_setup(client, "alice")
-    r = client.post("/api/auth/setup", json={"username": "bob", "password": DEFAULT_PW})
+    r = client.post("/api/auth/setup", json={"username": "bob", "password": DEFAULT_PW, "setup_code": main.SETUP_CODE})
     assert r.status_code == 400
     assert "already" in r.json()["detail"].lower()
 

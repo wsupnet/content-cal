@@ -1,6 +1,10 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-pydantic==2.8.2
-sqlmodel==0.0.22
+fastapi==0.143.1
+starlette==1.8.0
+uvicorn[standard]==0.54.0
+pydantic==2.14.1
+sqlmodel==0.0.48
 bcrypt==4.2.0
 itsdangerous==2.2.0
+# Transitive, pinned at versions with security fixes.
+anyio==4.15.1
+python-dotenv==1.2.4
