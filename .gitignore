@@ -21,9 +21,6 @@ calendar.json
 # macOS
 .DS_Store
 
-# Syncthing
-.stfolder
-
 # Old migrated data
 *.migrated
 

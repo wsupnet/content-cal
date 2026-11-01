@@ -81,8 +81,8 @@ The first person to open the app runs a one-time setup wizard that creates the a
 
 - **Backend** — Python 3.12, FastAPI, SQLModel over SQLite. ~1,500 lines, one file.
 - **Frontend** — A single `index.html` with vanilla JavaScript. No framework, no bundler, no `node_modules`.
-- **Auth** — bcrypt password hashing, signed (itsdangerous) session cookies, 30-day sessions.
-- **Tests** — ~80 pytest regression tests covering auth, workspace isolation, roles, invites, concurrency, and cascade deletes. A pre-push git hook runs them before every push.
+- **Auth** — bcrypt password hashing, signed (itsdangerous) session cookies, 30-day sessions, login throttling, invite-only sign-up.
+- **Tests** — ~140 pytest regression tests covering auth, workspace isolation, roles, invites, concurrency, and cascade deletes. A pre-push git hook runs them before every push.
 - **Deploy** — One Docker container behind whatever reverse proxy / Tailscale setup you already have.
 
 ## Documentation

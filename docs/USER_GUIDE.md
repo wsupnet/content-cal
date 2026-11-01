@@ -121,13 +121,19 @@ Your parking lot for ideas **without a date yet**. Capture a thought here, and w
 ![Backlog](screenshots/05_backlog.png)
 
 ### 📆 Quarter & 📅 Year
-Zoomed-out roll-ups. The **Year** view shows each month's count and a progress bar, so you can spot busy stretches and quiet gaps across the whole year.
+Zoomed-out roll-ups. The **Quarter** view shows the three months side by side, with every video listed under its month.
+
+![Quarter view](screenshots/06_quarter.png)
+
+The **Year** view shows each month's count and a progress bar, so you can spot busy stretches and quiet gaps across the whole year.
 
 ![Year view](screenshots/07_year.png)
 
-> On a phone, ContentCal automatically simplifies the layout so everything stays tappable.
+> On a phone, ContentCal automatically simplifies the layout so everything stays tappable. On the Kanban board, swipe sideways to move between status columns.
 >
-> ![Mobile list view](screenshots/15_mobile_list.png)
+> | List | Kanban |
+> |---|---|
+> | ![Mobile list view](screenshots/15_mobile_list.png) | ![Mobile Kanban board](screenshots/16_mobile_kanban.png) |
 
 ---
 
@@ -174,8 +180,8 @@ Open **Workspace settings** from the account menu (top-right):
 - **Invite link** — click **New invite** to generate a link. Anyone who opens it can join. You can set it to expire after a number of days, and revoke it anytime.
 
 **Roles:**
-- **Owner** — can rename the workspace, manage members, create/revoke invites, and moderate comments.
-- **Member** — can do everything with videos (add, edit, comment) but not manage the workspace.
+- **Owner** — can rename the workspace, manage channels and the goal, manage members, create/revoke invites, and moderate comments.
+- **Member** — can do everything with videos (add, edit, comment) but not change channels, the goal, or the workspace.
 
 You can belong to several workspaces (e.g. a personal one and a team one) and switch between them using the workspace dropdown in the top-left.
 
@@ -236,6 +242,12 @@ Up to 6 per workspace.
 
 **Is my data safe if two people edit at once?**
 Yes. If someone reorders or changes channels while you're editing, ContentCal will ask you to refresh rather than letting one person's change quietly overwrite another's.
+
+**Why did logging out sign me out on my other devices too?**
+That's on purpose: logging out (or changing your password) signs your account out everywhere, so a lost or shared device can't stay logged in.
+
+**It says "Too many attempts". What now?**
+After several wrong passwords, ContentCal pauses sign-in for a few minutes. Wait, then try again. A browser you've signed in with before isn't affected by someone else guessing at your account.
 
 **Where does my data live?**
 In a single database file on the server you (or your admin) run. Ask your admin about backups.

@@ -225,7 +225,7 @@ Developer Guide. Interactive OpenAPI docs (`/docs`) are off unless you set
 
 ## Development
 
-The backend has a pytest regression suite (~110 tests, ~60s). It runs inside
+The backend has a pytest regression suite (~140 tests, ~60s). It runs inside
 the app's Docker image, so the only requirement is Docker, on any OS. Common
 dev tasks are wrapped in a top-level `Makefile`:
 

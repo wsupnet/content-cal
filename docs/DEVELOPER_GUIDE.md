@@ -52,7 +52,7 @@ contentcalv3/
 │   ├── Dockerfile         # python:3.12-slim + uvicorn
 │   ├── requirements.txt   # fastapi, uvicorn, pydantic, sqlmodel, bcrypt, itsdangerous
 │   ├── requirements-dev.txt
-│   └── tests/             # ~110 pytest regression tests
+│   └── tests/             # ~140 pytest regression tests
 ├── frontend/
 │   └── index.html         # The entire frontend (HTML + CSS + JS)
 ├── docker-compose.yml     # Maps :8765 -> :8000, mounts $APPDATA/contentcal at /app/data
@@ -362,7 +362,7 @@ The entire UI is one `index.html` with inline CSS and JS — no build, no depend
 
 ## 17. Testing
 
-~110 pytest regression tests live in `backend/tests/`, organized by concern:
+~140 pytest regression tests live in `backend/tests/`, organized by concern:
 
 ```
 test_auth.py                test_invites.py
