@@ -10,7 +10,7 @@ from sqlmodel import SQLModel, Field, Column, JSON, create_engine, Session, sele
 from sqlalchemy import text, func
 from sqlalchemy.exc import IntegrityError
 from typing import Optional, List
-from datetime import date as _date, datetime, timedelta
+from datetime import date as _date, datetime, timedelta, timezone as _tz
 import asyncio, hashlib, json, os, pathlib, re, secrets, time
 from collections import deque
 try:
@@ -21,6 +21,11 @@ except Exception:
     ZoneInfo = None  # type: ignore
     def available_timezones():
         return set()
+
+def _utcnow() -> datetime:
+    # Naive UTC, same as the deprecated datetime.utcnow(). Stored timestamps
+    # are naive ISO strings compared as text, so they must not gain "+00:00".
+    return datetime.now(_tz.utc).replace(tzinfo=None)
 
 import bcrypt as _bcrypt
 from itsdangerous import URLSafeTimedSerializer, BadSignature
@@ -307,7 +312,7 @@ class User(SQLModel, table=True):
     username: str = Field(index=True, unique=True)
     password_hash: str
     default_workspace_id: int = 0
-    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = Field(default_factory=lambda: _utcnow().isoformat())
     # Embedded in every session cookie. Bumping it (on logout) invalidates
     # all of the user's existing cookies, including stolen copies.
     session_version: int = 0
@@ -316,7 +321,7 @@ class Workspace(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
     created_by_user_id: int = 0
-    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = Field(default_factory=lambda: _utcnow().isoformat())
     # Monotonic counter bumped on every channel-list mutation. Clients send the
     # value they last saw; mismatches trigger a 409 so concurrent edits don't
     # silently clobber each other (since Entry.channel is a positional index).
@@ -331,7 +336,7 @@ class WorkspaceMember(SQLModel, table=True):
     workspace_id: int = Field(index=True)
     user_id: int = Field(index=True)
     role: str = Field(default="member")  # 'owner' | 'member'
-    joined_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    joined_at: str = Field(default_factory=lambda: _utcnow().isoformat())
 
 class Comment(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -339,7 +344,7 @@ class Comment(SQLModel, table=True):
     workspace_id: int = Field(index=True)
     user_id: int = Field(index=True)
     body: str
-    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = Field(default_factory=lambda: _utcnow().isoformat())
     edited_at: Optional[str] = None
 
 class ActivityEvent(SQLModel, table=True):
@@ -350,14 +355,14 @@ class ActivityEvent(SQLModel, table=True):
     event_type: str  # 'status_changed' | 'date_changed'
     from_value: str = ""  # raw value (status key, or ISO date, or "" for blank)
     to_value: str = ""
-    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = Field(default_factory=lambda: _utcnow().isoformat())
 
 class WorkspaceInvite(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     workspace_id: int = Field(index=True)
     code: str = Field(index=True, unique=True)
     created_by_user_id: int
-    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = Field(default_factory=lambda: _utcnow().isoformat())
     expires_at: Optional[str] = None  # ISO datetime; None = no expiry
     used_by_user_id: Optional[int] = None
     used_at: Optional[str] = None
@@ -1034,7 +1039,7 @@ def _delete_workspace_cascade(session: Session, workspace_id: int) -> None:
     for inv in session.exec(select(WorkspaceInvite).where(WorkspaceInvite.workspace_id == workspace_id)).all():
         # Pre-revoke any open invites so dangling links can't be used to
         # "re-enter" the now-deleted workspace.
-        inv.revoked_at = datetime.utcnow().isoformat()
+        inv.revoked_at = _utcnow().isoformat()
         session.add(inv)
     for m in session.exec(select(WorkspaceMember).where(WorkspaceMember.workspace_id == workspace_id)).all():
         session.delete(m)
@@ -1181,7 +1186,7 @@ def signup(payload: SignupIn, response: Response, request: Request):
         # Honor invite code if present — atomic claim via conditional UPDATE so
         # two simultaneous accepts can't both succeed.
         if payload.invite_code:
-            now_iso = datetime.utcnow().isoformat()
+            now_iso = _utcnow().isoformat()
             result = session.exec(text(
                 "UPDATE workspaceinvite SET used_by_user_id=:uid, used_at=:ts "
                 "WHERE code=:code AND used_by_user_id IS NULL AND revoked_at IS NULL "
@@ -1208,7 +1213,7 @@ def _invite_is_usable(session: Session, code: Optional[str]) -> bool:
     inv = session.exec(select(WorkspaceInvite).where(WorkspaceInvite.code == code)).first()
     return bool(
         inv and inv.used_by_user_id is None and inv.revoked_at is None
-        and (inv.expires_at is None or inv.expires_at > datetime.utcnow().isoformat())
+        and (inv.expires_at is None or inv.expires_at > _utcnow().isoformat())
     )
 
 def _login_failure_limits(request: Request, username: str) -> list:
@@ -1517,7 +1522,7 @@ def create_invite(workspace_id: int, payload: InviteIn, user: User = Depends(cur
         _require_owner(session, workspace_id, user.id)
         expires_at = None
         if payload.expires_in_days and payload.expires_in_days > 0:
-            expires_at = (datetime.utcnow() + timedelta(days=payload.expires_in_days)).isoformat()
+            expires_at = (_utcnow() + timedelta(days=payload.expires_in_days)).isoformat()
         invite = WorkspaceInvite(
             workspace_id=workspace_id,
             code=secrets.token_urlsafe(12),
@@ -1552,7 +1557,7 @@ def revoke_invite(code: str, user: User = Depends(current_user)):
         if not inv:
             raise HTTPException(status_code=404, detail="Invite not found.")
         _require_owner(session, inv.workspace_id, user.id)
-        inv.revoked_at = datetime.utcnow().isoformat()
+        inv.revoked_at = _utcnow().isoformat()
         session.add(inv)
         session.commit()
         return {"ok": True}
@@ -1572,7 +1577,7 @@ def preview_invite(code: str, request: Request):
             raise HTTPException(status_code=410, detail="This invite has been revoked.")
         if inv.used_by_user_id:
             raise HTTPException(status_code=410, detail="This invite has already been used.")
-        if inv.expires_at and inv.expires_at < datetime.utcnow().isoformat():
+        if inv.expires_at and inv.expires_at < _utcnow().isoformat():
             raise HTTPException(status_code=410, detail="This invite has expired.")
         ws = session.get(Workspace, inv.workspace_id)
         return {"workspace_name": ws.name if ws else "(unknown)", "workspace_id": inv.workspace_id}
@@ -1588,7 +1593,7 @@ def accept_invite(code: str, response: Response, user: User = Depends(current_us
             raise HTTPException(status_code=410, detail="Invite not valid.")
         if _is_member(session, inv.workspace_id, user.id):
             raise HTTPException(status_code=400, detail="You're already a member of this workspace.")
-        now_iso = datetime.utcnow().isoformat()
+        now_iso = _utcnow().isoformat()
         result = session.exec(text(
             "UPDATE workspaceinvite SET used_by_user_id=:uid, used_at=:ts "
             "WHERE code=:code AND used_by_user_id IS NULL AND revoked_at IS NULL "
@@ -1874,7 +1879,7 @@ def edit_comment(comment_id: int, payload: CommentIn, ws: Workspace = Depends(cu
         if c.user_id != user.id:
             raise HTTPException(status_code=403, detail="You can only edit your own comments.")
         c.body = body
-        c.edited_at = datetime.utcnow().isoformat()
+        c.edited_at = _utcnow().isoformat()
         session.add(c)
         session.commit()
         session.refresh(c)
