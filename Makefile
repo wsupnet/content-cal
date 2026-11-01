@@ -14,7 +14,7 @@
 # The pre-push hook runs the test suite before every `git push`. If you ever
 # need to bypass it (rare, e.g. pushing a WIP branch), use `git push --no-verify`.
 
-.PHONY: help setup test test-local test-image install-hooks dev-deps
+.PHONY: help setup test test-local test-image install-hooks dev-deps check-python
 
 help:
 	@echo "ContentCal — make targets"
@@ -35,7 +35,16 @@ setup: test-image install-hooks
 # installs the pytest entry-point script.
 PY ?= python3
 
-dev-deps:
+# The backend needs Python 3.11+. Older versions install outdated test
+# packages and then fail tests in confusing ways, so stop early instead.
+check-python:
+	@$(PY) -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' || { \
+	  echo "✗ $(PY) is Python $$($(PY) -c 'import platform; print(platform.python_version())'); ContentCal needs 3.11+."; \
+	  echo "  Use 'make test' (Docker) instead, or point PY at a newer one: make test-local PY=python3.12"; \
+	  exit 1; \
+	}
+
+dev-deps: check-python
 	cd backend && $(PY) -m pip install -r requirements-dev.txt
 
 test-image:
@@ -46,7 +55,7 @@ test-image:
 test: test-image
 	docker run --rm -v "$(CURDIR)/backend:/app" -v "$(CURDIR)/frontend:/frontend:ro" contentcal-test
 
-test-local:
+test-local: check-python
 	cd backend && $(PY) -m pytest -q
 
 install-hooks:
