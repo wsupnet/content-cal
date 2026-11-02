@@ -28,6 +28,7 @@ first start and renamed to `calendar.json.migrated`.)
 - ⏱️ Timezone-aware auto-publish for scheduled videos
 - 📥 CSV import (with column mapping + duplicate detection) and export
 - 🌙 Dark mode and responsive mobile layout
+- 💾 Automatic daily database snapshots, with backup, download and one-click restore for the admin
 - 🔒 Account-based auth (bcrypt + signed session cookies); all data stays on your server
 
 ---
@@ -110,6 +111,7 @@ commented out, with notes):
 | `ALLOW_OPEN_SIGNUP` | off | `1` lets anyone create an account; otherwise invite-only |
 | `COOKIE_SECURE` | off | `1` when served over HTTPS: HTTPS-only cookie + HSTS |
 | `FORWARDED_ALLOW_IPS` | `127.0.0.1` | Your reverse proxy's IP/subnet, so each user gets their own rate limits. Only set it when **every** request goes through the proxy (see the compose file) |
+| `BACKUP_KEEP` | `14` | How many daily database snapshots to keep in `backups/` (see [Data Backup](#data-backup)); `0` turns them off |
 | `MAX_REQUEST_BYTES` | 2.5 MB | Largest channel save / CSV import chunk |
 | `SETUP_CODE` | random per start | Fixed first-run setup code, if you'd rather set one |
 | `SESSION_SECRET` | generated in the data folder | Signs login cookies; changing it signs everyone out |
@@ -183,11 +185,47 @@ lives in one SQLite file:
 /volume1/docker/appdata/contentcal/calendar.db
 ```
 
-Back this up with your normal NAS backup routine (rsync, Hyper Backup, etc.).
-The same folder also holds a `.session_secret` file; preserving it keeps users
-logged in across restarts.
+Don't back up `calendar.db` itself: a copy taken while someone is saving can
+be corrupt. Instead, the app writes a consistent snapshot to the `backups`
+folder next to it when it starts and once a day after that, and keeps the 14
+newest (`BACKUP_KEEP` changes how many):
+```
+/volume1/docker/appdata/contentcal/backups/calendar-20261102T031500Z.db
+```
 
-Both files are readable only by the account the container runs as (root by
+Point your normal NAS backup routine (rsync, Hyper Backup, etc.) at that
+`backups` folder. A snapshot only appears once it's fully written, so it's
+safe to copy at any time. Also back up the `.session_secret` file in the data
+folder; restoring it keeps users logged in.
+
+### Restoring
+
+Sign in with the admin account (the one created at first-run setup) and open
+**Server backups** from the user menu. From there you can:
+
+- **Back up now** — take a snapshot on demand, e.g. before a big CSV import.
+- **Download** a snapshot to keep a copy off the NAS.
+- **Restore** any snapshot in the list, or **Restore from file** to upload one
+  you downloaded earlier or pulled from your NAS backup.
+
+A restore replaces everything on the server (every workspace, account, video
+and comment) and signs everyone out, so people sign in again with their
+accounts as they were in the backup. The current data is saved as a snapshot
+first, so a restore can itself be undone from the same list. Only the admin
+sees this menu.
+
+If the app won't start at all, restore by hand instead: stop the container,
+replace `calendar.db` with a snapshot, delete any `calendar.db-journal` next
+to it, and start the container again:
+
+```bash
+docker compose stop contentcal
+cp backups/calendar-20261102T031500Z.db calendar.db   # run in the data folder
+rm -f calendar.db-journal
+docker compose start contentcal
+```
+
+Snapshots and the session key are readable only by the account the container runs as (root by
 default) because they hold password hashes and the session key. Run backups as
 an admin, or set the compose `user:` line to your own account so the files are
 yours.

@@ -61,7 +61,7 @@ contentcalv3/
 └── README.md
 ```
 
-> Data files (`calendar.db`, `.session_secret`, the migrated legacy `calendar.json`) live in `$APPDATA/contentcal` (mounted at `/app/data`) at runtime, **outside** the repo. On the NAS that is `/volume1/docker/appdata/contentcal`; on a Mac, `./dev-data/contentcal` (gitignored).
+> Data files (`calendar.db`, `.session_secret`, the `backups/` snapshot folder, the migrated legacy `calendar.json`) live in `$APPDATA/contentcal` (mounted at `/app/data`) at runtime, **outside** the repo. On the NAS that is `/volume1/docker/appdata/contentcal`; on a Mac, `./dev-data/contentcal` (gitignored).
 
 ---
 
@@ -115,11 +115,13 @@ On an empty database the app seeds three default channels and waits. The first b
 │  ├─ Invite routes    (/api/invites/*)         │
 │  ├─ Data routes      (/api/data, /entries…)   │  ← all workspace-scoped
 │  ├─ Discussion       (/api/.../comments,feed) │
+│  ├─ Server backups   (/api/admin/*)           │  ← server admin only
 │  └─ StaticFiles("/") → serves the frontend    │
 └───────────────┬──────────────────────────────┘
                 │ SQLModel / SQLAlchemy
 ┌───────────────▼──────────────────────────────┐
 │  SQLite  (/app/data/calendar.db)              │
+│  snapshots → /app/data/backups/ (daily)       │
 └──────────────────────────────────────────────┘
 ```
 
@@ -278,6 +280,8 @@ Centralized helpers at the top of `main.py` enforce:
 
 SQLite + SQLModel don't auto-add columns to existing tables, so `init_db()` runs an **idempotent `ALTER TABLE` pass** on every boot via `_ensure_column` (checks `PRAGMA table_info` first). It backfills `workspace_id`, `channels_version`, `timezone`, and member `role`, and promotes each workspace's creator to `owner` if no owner exists yet. It also performs a one-time import of a legacy `calendar.json` into the DB (renaming it to `*.migrated`) when starting from a truly empty database.
 
+The same `init_db()` runs again right after a backup restore, so a snapshot taken before a migration comes back with the current columns.
+
 This means upgrades are just "pull and restart" — no migration tool required.
 
 ---
@@ -330,6 +334,19 @@ All routes are same-origin and (except where noted) require the session cookie. 
 | PUT | `/api/channels` | Replace channel list (needs `X-Channels-Version`) |
 | DELETE | `/api/channels/{index}` | Remove one channel (re-indexes entries) |
 
+### Server backups (admin only)
+The admin is the account created at first-run setup (lowest user id; accounts are never deleted). `GET /api/me` returns `user.is_admin`; every other caller gets `403`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/admin/backups` | Snapshots in `$DATA_DIR/backups/`, newest first, plus `keep` (`BACKUP_KEEP`) |
+| POST | `/api/admin/backups` | Take a snapshot now (works even with `BACKUP_KEEP=0`) |
+| GET | `/api/admin/backups/{name}` | Download a snapshot |
+| POST | `/api/admin/backups/{name}/restore` | Restore a snapshot |
+| POST | `/api/admin/restore` | Restore from an uploaded file (raw request body, up to 256 MB) |
+
+`restore_db()` checks the file (SQLite `integrity_check`, ContentCal's tables, at least one account), snapshots the current data, copies the backup over the live database with SQLite's backup API, re-runs `init_db()` migrations in case the backup predates them, and bumps every user's `session_version`, which signs everyone out. A snapshot being restored is copied aside first, because the safety snapshot may prune it.
+
 ### Discussion
 | Method | Path | Purpose |
 |---|---|---|
@@ -370,7 +387,8 @@ test_auto_publish.py        test_roles.py
 test_bulk_import.py         test_workspace_isolation.py
 test_cascade_delete.py      test_comments.py
 test_channels_race.py       test_entries.py
-test_security.py
+test_security.py            test_backup.py
+test_admin_backups.py
 ```
 
 Run them via the Makefile:
@@ -402,6 +420,7 @@ After `make install-hooks`, every `git push` runs the suite first and blocks on 
 | `ALLOW_OPEN_SIGNUP` | _(unset)_ | `1` lets anyone create an account. Default: sign-up needs a valid invite, and the account is only created if the invite is claimed. |
 | `COOKIE_SECURE` | _(unset)_ | `1` marks the session cookie `Secure` (HTTPS-only). Leave unset for plain-HTTP LAN use. |
 | `ENABLE_API_DOCS` | _(unset)_ | `1` serves `/docs`, `/redoc`, `/openapi.json` (dev only; `/docs` loads from a CDN). |
+| `BACKUP_KEEP` | `14` | Snapshots kept in `$DATA_DIR/backups/`. `backup_db()` writes one at every start and every 24 h after (SQLite online backup API, temp file renamed into place), then prunes the oldest. `0` turns snapshots off. |
 | `MAX_REQUEST_BYTES` | `2621440` (2.5 MB) | Cap for `PUT /api/channels` and `POST /api/entries/bulk`; other routes use fixed 256 KB / 16 KB caps. Larger bodies get `413`. |
 
 Port: container listens on `8000`; `docker-compose.yml` maps host `8765 → 8000`.
@@ -420,6 +439,7 @@ Port: container listens on `8000`; `docker-compose.yml` maps host `8765 → 8000
 - **No third-party requests** — Lucide is vendored at `frontend/vendor/lucide.min.js` (pinned v1.49.0) and the UI uses system fonts, so a page load only talks to your server.
 - **Rate limiting is in-memory/per-process** — fine for the single supported container. Behind a reverse proxy set `FORWARDED_ALLOW_IPS` to the proxy only (never a gateway other machines can reach), or all users share one bucket.
 - **Icon/notes/link inputs are bounded and sanitized** server-side (defense in depth against stored XSS even if the client forgets to escape).
+- **Server backups are admin-only** — only the first account (from first-run setup) can list, download or restore snapshots; downloads hold every password hash, so treat them like the database itself. A restore signs everyone out, and the uploaded file must pass SQLite's `integrity_check` and contain ContentCal's tables and at least one account.
 - **No password reset flow** for forgotten passwords — users can change their own password, but a forgotten one needs an operator with DB access to reset the hash.
 - **CSV export** prefixes cells starting with `=`, `+`, `-`, `@`, tab or CR with `'` so spreadsheets don't run them as formulas; import strips it again.
 

@@ -331,6 +331,10 @@ input[type="color"]{width:36px;height:28px;padding:2px;border-radius:var(--radiu
 .user-menu-panel.open{display:block}
 /* Workspace settings — reuses channels-panel layout patterns */
 .member-row,.invite-row{display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);padding:var(--space-2) var(--space-3);background:var(--color-surface-2);border:1px solid var(--color-border);border-radius:var(--radius-md);margin-bottom:var(--space-2);font-size:var(--text-xs)}
+.backup-actions{display:flex;gap:var(--space-2);margin-bottom:var(--space-3)}
+.backup-actions>button{flex:1;display:flex;align-items:center;justify-content:center;gap:var(--space-2);font-size:var(--text-xs)}
+a.btn-ghost{text-decoration:none}
+.panel-note{font-size:10px;color:var(--color-text-muted);margin-bottom:var(--space-3);line-height:1.5}
 .invite-code-text{font-family:monospace;font-size:11px;color:var(--color-text-muted);user-select:all;cursor:pointer;flex:1;overflow:hidden;text-overflow:ellipsis}
 /* Discussion (comments + activity feed) in the Edit modal */
 .discussion-section{margin-top:var(--space-5);border-top:1px solid var(--color-divider);padding-top:var(--space-4)}
@@ -630,6 +634,12 @@ body.app-busy{cursor:progress}
 <div class="channels-panel" id="workspace-panel">
   <div class="panel-header"><h2 class="panel-title">Workspace Settings</h2><button class="btn-icon" onclick="toggleWorkspacePanel()"><i data-lucide="x" style="width:18px;height:18px"></i></button></div>
   <div id="workspace-panel-body"></div>
+</div>
+<!-- Server Backups Panel (server admin only) -->
+<div class="channels-panel" id="backups-panel">
+  <div class="panel-header"><h2 class="panel-title">Server Backups</h2><button class="btn-icon" onclick="toggleBackupsPanel()"><i data-lucide="x" style="width:18px;height:18px"></i></button></div>
+  <div id="backups-panel-body"></div>
+  <input type="file" id="restore-file-input" accept=".db,.sqlite,.sqlite3" style="display:none" onchange="restoreFromFile(this)">
 </div>
 <div class="toast-container" id="toast-container"></div>
 
@@ -1049,6 +1059,7 @@ function renderHeaderUserUi(){
       <div style="font-size:10px;color:var(--color-text-muted)">${escHtml(currentWorkspace?currentWorkspace.name:'')}</div>
     </div>
     <button class="ws-menu-item" onclick="toggleWorkspacePanel()"><i data-lucide="settings-2" style="width:13px;height:13px"></i>Workspace settings</button>
+    ${currentUser.is_admin?`<button class="ws-menu-item" onclick="toggleBackupsPanel()"><i data-lucide="database-backup" style="width:13px;height:13px"></i>Server backups</button>`:''}
     <button class="ws-menu-item" onclick="openPasswordModal()"><i data-lucide="key-round" style="width:13px;height:13px"></i>Change password</button>
     <button class="ws-menu-item" onclick="doLogout(this)"><i data-lucide="log-out" style="width:13px;height:13px"></i>Log out</button>`;
   lucide.createIcons({nodes:[document.getElementById('user-menu-panel')]});
@@ -1327,6 +1338,111 @@ async function leaveWorkspace(btn){
       doLogout();
     }
   }catch(e){showToast(parseErr(e),'error');}});
+}
+
+// ── Server backups panel (server admin only) ─────────────────────
+async function toggleBackupsPanel(){
+  const panel=document.getElementById('backups-panel');
+  const opening=!panel.classList.contains('open');
+  panel.classList.toggle('open');
+  document.getElementById('user-menu-panel').classList.remove('open');
+  if(opening){
+    document.getElementById('backups-panel-body').innerHTML=inlineLoadingHtml('Loading backups…');
+    await renderBackupsPanel();
+  }
+}
+
+// Backups shown in the open panel; handlers look them up by index.
+let panelBackups=[];
+function fmtBackupTime(iso){return new Date(iso).toLocaleString(undefined,{dateStyle:'medium',timeStyle:'medium'});}
+function fmtBytes(n){
+  if(n<1024)return `${n} B`;
+  if(n<1024*1024)return `${(n/1024).toFixed(0)} KB`;
+  return `${(n/1024/1024).toFixed(1)} MB`;
+}
+
+async function renderBackupsPanel(){
+  const body=document.getElementById('backups-panel-body');
+  let data;
+  try{data=await apiFetch('/api/admin/backups');}catch(e){
+    body.innerHTML=emptyStateHtml({icon:'wifi-off',title:"Couldn't load backups",sub:parseErr(e),action:`<button class="btn-primary" onclick="withBusy(this,renderBackupsPanel)">Retry</button>`,compact:true});
+    lucide.createIcons({nodes:[body]});
+    return;
+  }
+  panelBackups=data.backups||[];
+  const schedule=data.keep>0
+    ?`The server saves a snapshot when it starts and once a day, and keeps the newest ${Number(data.keep)}.`
+    :'Automatic snapshots are off (BACKUP_KEEP=0). Snapshots you take here are kept until you delete them from the backups folder.';
+  const rows=panelBackups.length?panelBackups.map((b,i)=>`<div class="member-row">
+      <div><div style="font-weight:600">${escHtml(fmtBackupTime(b.created_at))}</div><div style="font-size:10px;color:var(--color-text-muted)">${escHtml(fmtBytes(b.size))}</div></div>
+      <div style="display:flex;gap:var(--space-1)">
+        <a class="btn-ghost" href="/api/admin/backups/${encodeURIComponent(b.name)}" download style="font-size:11px;padding:var(--space-1) var(--space-2)" title="Download this snapshot"><i data-lucide="download" style="width:12px;height:12px"></i>Download</a>
+        <button class="btn-ghost" onclick="restoreSnapshot(${i},this)" style="font-size:11px;color:var(--color-error);padding:var(--space-1) var(--space-2)" title="Restore this snapshot"><i data-lucide="history" style="width:12px;height:12px"></i>Restore</button>
+      </div>
+    </div>`).join(''):emptyStateHtml({icon:'database',title:'No snapshots yet',sub:'Take one now with Back up now.',compact:true});
+  body.innerHTML=`
+    <div class="panel-note">Snapshots cover the whole server: every workspace, account, video and comment. ${escHtml(schedule)}</div>
+    <div class="backup-actions">
+      <button class="btn-primary" onclick="backupNow(this)"><i data-lucide="database-backup" style="width:14px;height:14px"></i>Back up now</button>
+      <button class="btn-secondary" onclick="pickRestoreFile()"><i data-lucide="upload" style="width:14px;height:14px"></i>Restore from file</button>
+    </div>
+    <div class="panel-note"><i data-lucide="alert-triangle" style="width:11px;height:11px;vertical-align:-1px"></i> Restoring replaces everything on this server with the backup's copy and signs everyone out. The current data is saved as a snapshot first, so you can undo it.</div>
+    ${rows}`;
+  lucide.createIcons({nodes:[body]});
+}
+
+async function backupNow(btn){
+  return withBusy(btn,async()=>{try{
+    await apiFetch('/api/admin/backups',{method:'POST'});
+    await renderBackupsPanel();
+    showToast('Snapshot saved');
+  }catch(e){showToast(parseErr(e),'error');}});
+}
+
+function confirmRestore(what){
+  return confirm(`Restore ${what}?\n\nEvery workspace, account and video on this server goes back to that copy, and everyone is signed out. The current data is saved as a snapshot first.`);
+}
+
+async function restoreSnapshot(i,btn){
+  const b=panelBackups[i];if(!b)return;
+  if(!confirmRestore(`the snapshot from ${fmtBackupTime(b.created_at)}`))return;
+  return withBusy(btn,async()=>{try{
+    await apiFetch(`/api/admin/backups/${encodeURIComponent(b.name)}/restore`,{method:'POST'});
+    afterRestore();
+  }catch(e){showToast(parseErr(e),'error');}});
+}
+
+function pickRestoreFile(){
+  const input=document.getElementById('restore-file-input');
+  input.value='';input.click();
+}
+
+async function restoreFromFile(input){
+  const file=input.files&&input.files[0];if(!file)return;
+  if(!confirmRestore(`"${file.name}"`))return;
+  const btn=document.querySelector('#backups-panel .backup-actions .btn-secondary');
+  return withBusy(btn,async()=>{
+    // Sent as the raw body (not JSON), so apiFetch can't be used here.
+    let res;
+    _trackRequest(1);
+    try{
+      res=await fetch(API+'/api/admin/restore',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/octet-stream'},body:file});
+    }catch{showToast('Upload failed. Check your connection.','error');return;}
+    finally{_trackRequest(-1);}
+    if(!res.ok){
+      let msg='Restore failed';try{msg=await res.text()||msg;}catch{}
+      showToast(parseErr(new Error(msg)),'error');
+      return;
+    }
+    afterRestore();
+  });
+}
+
+// Everyone, including us, is signed out by a restore.
+function afterRestore(){
+  document.getElementById('backups-panel').classList.remove('open');
+  doLogout();
+  showToast('Restored. Sign in again with your account as it was in the backup.');
 }
 
 // ── Toast ─────────────────────────────────────────────────────────

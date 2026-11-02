@@ -37,6 +37,9 @@ services:
       # Largest body for channel saves / CSV import chunks (default 2.5 MB).
       # Other requests are capped lower in code (256 KB; 16 KB when logged out).
       # - MAX_REQUEST_BYTES=2621440
+      # Database snapshots kept in $APPDATA/contentcal/backups (one at each
+      # start, then one a day). Back up that folder, not calendar.db. 0 = off.
+      # - BACKUP_KEEP=14
       # Serving over HTTPS (reverse proxy, Tailscale Serve)? Mark the login
       # cookie HTTPS-only. Don't set it for plain http:// or logins will fail.
       # - COOKIE_SECURE=1

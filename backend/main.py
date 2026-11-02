@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Request, Response, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
 from starlette.requests import cookie_parser
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,7 +11,7 @@ from sqlalchemy import text, func
 from sqlalchemy.exc import IntegrityError
 from typing import Optional, List
 from datetime import date as _date, datetime, timedelta, timezone as _tz
-import asyncio, hashlib, json, os, pathlib, re, secrets, time
+import asyncio, hashlib, json, os, pathlib, re, secrets, sqlite3, threading, time
 from collections import deque
 try:
     from zoneinfo import ZoneInfo, available_timezones  # py3.9+
@@ -123,6 +123,12 @@ ALLOW_OPEN_SIGNUP = os.getenv("ALLOW_OPEN_SIGNUP", "").strip().lower() in ("1", 
 # over HTTPS (reverse proxy, Tailscale Serve); leave off for plain-HTTP LAN use
 # or browsers will drop the cookie and nobody can log in.
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "").strip().lower() in ("1", "true", "yes")
+
+# Number of database snapshots kept in DATA_DIR/backups (see backup_db).
+# 0 turns the automatic ones off; the admin can still take them by hand.
+BACKUP_DIR = DATA_DIR / "backups"
+BACKUP_KEEP = max(0, int(os.getenv("BACKUP_KEEP", "14")))
+BACKUP_INTERVAL_SECONDS = 24 * 3600
 if REQUIRE_EXISTING_DB and not DB_FILE.is_file():
     raise RuntimeError(
         f"[fatal] REQUIRE_EXISTING_DB is set but no database exists at {DB_FILE}. "
@@ -665,12 +671,110 @@ def _print_setup_code_if_needed() -> None:
         flush=True,  # Docker block-buffers stdout; the code must reach the log now.
     )
 
+# ── Backups ───────────────────────────────────────────────────────
+# Copying calendar.db while a save is in progress can produce a corrupt copy,
+# so the server writes its own consistent snapshots with SQLite's online backup
+# API. Each is written to a temp file and renamed into place, so a NAS backup
+# reading the folder never sees a half-written snapshot.
+# One lock for snapshots and restores, so they never interleave. Reentrant
+# because a restore takes a safety snapshot while holding it.
+_backup_lock = threading.RLock()
+
+# Tables a file must have to be accepted as a ContentCal database on restore.
+RESTORE_REQUIRED_TABLES = {"user", "workspace", "workspacemember", "channel", "entry"}
+
+def _copy_db(src_path: pathlib.Path, dst_path: pathlib.Path) -> None:
+    src = sqlite3.connect(src_path)
+    try:
+        dst = sqlite3.connect(dst_path, timeout=30)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+def backup_db(force: bool = False) -> Optional[pathlib.Path]:
+    """Write a snapshot to BACKUP_DIR and prune all but the newest
+    BACKUP_KEEP. Returns the snapshot's path, or None when there's nothing to
+    do (no database yet, or automatic snapshots are off and force is False)."""
+    if (BACKUP_KEEP <= 0 and not force) or not DB_FILE.is_file():
+        return None
+    with _backup_lock:
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        # Leftovers from a backup interrupted by a shutdown.
+        for stale in BACKUP_DIR.glob("calendar-*.db.tmp"):
+            stale.unlink(missing_ok=True)
+        # UTC timestamps sort lexically in time order, which pruning relies on.
+        dest = BACKUP_DIR / f"calendar-{_utcnow().strftime('%Y%m%dT%H%M%SZ')}.db"
+        tmp = dest.with_name(dest.name + ".tmp")
+        _copy_db(DB_FILE, tmp)
+        os.replace(tmp, dest)
+        try:
+            os.chmod(dest, 0o600)
+        except Exception:
+            pass
+        if BACKUP_KEEP > 0:
+            for old in sorted(BACKUP_DIR.glob("calendar-*.db"))[:-BACKUP_KEEP]:
+                old.unlink(missing_ok=True)
+        return dest
+
+def _check_restorable(path: pathlib.Path) -> None:
+    """400 unless path is an intact ContentCal database with at least one
+    account (restoring one without accounts would lock everybody out)."""
+    not_ours = HTTPException(status_code=400, detail="That file isn't a ContentCal backup.")
+    try:
+        con = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise HTTPException(status_code=400, detail="That backup is damaged and can't be restored.")
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not RESTORE_REQUIRED_TABLES <= tables:
+                raise not_ours
+            if not con.execute('SELECT COUNT(*) FROM "user"').fetchone()[0]:
+                raise HTTPException(status_code=400, detail="That backup has no accounts, so nobody could sign in after restoring it.")
+        finally:
+            con.close()
+    except sqlite3.DatabaseError:
+        raise not_ours
+
+def restore_db(staged: pathlib.Path) -> pathlib.Path:
+    """Replace the live database with the one at `staged` (a private copy the
+    caller deletes afterwards). Snapshots the current data first so the
+    restore can be undone, runs the usual migrations in case the backup
+    predates them, and signs every account out. Returns the safety snapshot."""
+    with _backup_lock:
+        _check_restorable(staged)
+        safety = backup_db(force=True)
+        engine.dispose()  # no pooled connection should hold the old file open
+        _copy_db(staged, DB_FILE)
+        engine.dispose()
+        init_db()
+        with Session(engine) as session:
+            session.exec(text('UPDATE "user" SET session_version = COALESCE(session_version, 0) + 1'))
+            session.commit()
+        return safety
+
+async def _backup_loop() -> None:
+    # One snapshot at every start, then one a day.
+    while True:
+        try:
+            path = await asyncio.to_thread(backup_db)
+            if path:
+                print(f"[backup] Wrote {path.name}", flush=True)
+        except Exception as e:
+            print(f"[backup] Snapshot failed: {e!r}", flush=True)
+        await asyncio.sleep(BACKUP_INTERVAL_SECONDS)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     _warn_on_orphan_zero_workspace()
     _print_setup_code_if_needed()
+    backups = asyncio.create_task(_backup_loop()) if BACKUP_KEEP else None
     yield
+    if backups:
+        backups.cancel()
 
 # The interactive API docs are off unless ENABLE_API_DOCS=1: they publish a map
 # of every endpoint, and /docs loads Swagger UI from a third-party CDN.
@@ -707,11 +811,15 @@ if _cors_origins:
 #     session cookie (401), so anonymous bodies are never read;
 #   - caps the body per route: 16 KB for public endpoints, 256 KB for normal
 #     authenticated ones, MAX_REQUEST_BYTES (2.5 MB) only for the two bulk
-#     endpoints (channel save with six 300 KB icons; CSV import chunks);
+#     endpoints (channel save with six 300 KB icons; CSV import chunks), and
+#     MAX_RESTORE_BYTES for the admin's database upload;
 #   - lets at most two large bodies be processed at once.
 PUBLIC_BODY_BYTES = 16 * 1024
 DEFAULT_BODY_BYTES = 256 * 1024
 MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", str(int(2.5 * 1024 * 1024))))
+# Uploading a database file to restore (admin only; the whole calendar).
+MAX_RESTORE_BYTES = 256 * 1024 * 1024
+RESTORE_UPLOAD_ROUTE = ("POST", "/api/admin/restore")
 _LARGE_BODY_ROUTES = {("PUT", "/api/channels"), ("POST", "/api/entries/bulk")}
 _large_body_slots = asyncio.Semaphore(2)
 
@@ -749,7 +857,12 @@ class RequestGuardMiddleware:
             else:
                 if not _has_signed_session(scope):
                     return await _send_json(send, 401, {"detail": "Not authenticated"})
-                cap = MAX_REQUEST_BYTES if (method, path) in _LARGE_BODY_ROUTES else DEFAULT_BODY_BYTES
+                if (method, path) == RESTORE_UPLOAD_ROUTE:
+                    cap = MAX_RESTORE_BYTES
+                elif (method, path) in _LARGE_BODY_ROUTES:
+                    cap = MAX_REQUEST_BYTES
+                else:
+                    cap = DEFAULT_BODY_BYTES
         else:
             cap = PUBLIC_BODY_BYTES  # static files never take a body
         declared = None
@@ -1283,7 +1396,7 @@ def me(request: Request, user: User = Depends(current_user)):
         }
         sess = _read_session(request) or {}
         return {
-            "user": user_dict(user),
+            "user": {**user_dict(user), "is_admin": _is_admin(session, user.id)},
             "workspaces": [{**workspace_dict(w), "role": roles.get(w.id, "member")} for w in wss],
             "active_workspace_id": sess.get("wsid") or user.default_workspace_id,
         }
@@ -2023,6 +2136,88 @@ def delete_channel(channel_index: int, ws: Workspace = Depends(owner_workspace))
             "entries": [entry_dict(e) for e in new_entries],
             "channels_version": ws_live.channels_version if ws_live else 0,
         }
+
+# ── Server backups (admin only) ───────────────────────────────────
+# A restore replaces every workspace and account, so it belongs to the server
+# admin: the account created at first-run setup. Accounts are never deleted,
+# so that's always the lowest user id.
+BACKUP_NAME_RE = re.compile(r"calendar-\d{8}T\d{6}Z\.db")
+
+def _is_admin(session: Session, user_id: int) -> bool:
+    return session.exec(select(func.min(User.id))).one() == user_id
+
+def admin_user(user: User = Depends(current_user)) -> User:
+    with Session(engine) as session:
+        if not _is_admin(session, user.id):
+            raise HTTPException(status_code=403, detail="Only the server admin can manage backups.")
+    return user
+
+def _backup_dict(path: pathlib.Path) -> dict:
+    taken = datetime.strptime(path.name[len("calendar-"):-len(".db")], "%Y%m%dT%H%M%SZ")
+    return {"name": path.name, "size": path.stat().st_size, "created_at": taken.isoformat() + "Z"}
+
+def _snapshot_path(name: str) -> pathlib.Path:
+    path = BACKUP_DIR / name
+    if not BACKUP_NAME_RE.fullmatch(name) or not path.is_file():
+        raise HTTPException(status_code=404, detail="Backup not found.")
+    return path
+
+def _staging_path() -> pathlib.Path:
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    return BACKUP_DIR / f"restore-{secrets.token_hex(8)}.tmp"
+
+def _restored(response: Response, safety: pathlib.Path) -> dict:
+    _clear_session_cookie(response)
+    print(f"[backup] Restored the database; the previous data is in {safety.name}", flush=True)
+    return {"safety_backup": safety.name}
+
+@app.get("/api/admin/backups")
+def list_backups(user: User = Depends(admin_user)):
+    snaps = sorted(BACKUP_DIR.glob("calendar-*.db"), reverse=True) if BACKUP_DIR.is_dir() else []
+    return {
+        "backups": [_backup_dict(p) for p in snaps if BACKUP_NAME_RE.fullmatch(p.name)],
+        "keep": BACKUP_KEEP,
+    }
+
+@app.post("/api/admin/backups")
+def create_backup(user: User = Depends(admin_user)):
+    path = backup_db(force=True)
+    if not path:
+        raise HTTPException(status_code=500, detail="There's no database to back up yet.")
+    return _backup_dict(path)
+
+@app.get("/api/admin/backups/{name}")
+def download_backup(name: str, user: User = Depends(admin_user)):
+    return FileResponse(_snapshot_path(name), filename=name, media_type="application/vnd.sqlite3")
+
+@app.post("/api/admin/backups/{name}/restore")
+def restore_backup(name: str, response: Response, user: User = Depends(admin_user)):
+    """Restores a snapshot from the backups folder. It's copied aside first,
+    because the safety snapshot taken during the restore may prune it."""
+    staged = _staging_path()
+    try:
+        _copy_db(_snapshot_path(name), staged)
+        return _restored(response, restore_db(staged))
+    finally:
+        staged.unlink(missing_ok=True)
+
+@app.post("/api/admin/restore")
+async def restore_upload(request: Request, response: Response, user: User = Depends(admin_user)):
+    """Restores from an uploaded database file, sent as the raw request body."""
+    staged = _staging_path()
+    try:
+        size = 0
+        with open(staged, "wb") as f:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > MAX_RESTORE_BYTES:
+                    raise HTTPException(status_code=413, detail="That file is too large to restore.")
+                f.write(chunk)
+        if not size:
+            raise HTTPException(status_code=400, detail="Choose a backup file to upload.")
+        return _restored(response, await asyncio.to_thread(restore_db, staged))
+    finally:
+        staged.unlink(missing_ok=True)
 
 # Serve frontend (catch-all). Must be mounted LAST.
 app.mount("/", StaticFiles(directory="/frontend", html=True), name="frontend")

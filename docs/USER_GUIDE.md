@@ -223,6 +223,7 @@ Already have your plan in a spreadsheet? Use **Import CSV** (top bar).
 - **Bulk edit** — in List view, click **Select** to tick multiple videos and change their status, channel, or format all at once (or delete them together).
 - **Today button** — jumps the calendar back to the current date.
 - **Filtering** — remember, clicking channel badges hides/shows channels across every view.
+- **Server backups** (admin only) — the account that set up ContentCal sees **Server backups** in the user menu. It lists the server's automatic snapshots, with buttons to take one now, download one, or restore one (or a file you upload). Restoring rolls the *whole server* back, every workspace included, and signs everyone out; the current data is saved as a snapshot first, so it can be undone.
 
 ---
 
@@ -250,7 +251,7 @@ That's on purpose: logging out (or changing your password) signs your account ou
 After several wrong passwords, ContentCal pauses sign-in for a few minutes. Wait, then try again. A browser you've signed in with before isn't affected by someone else guessing at your account.
 
 **Where does my data live?**
-In a single database file on the server you (or your admin) run. Ask your admin about backups.
+In a single database file on the server you (or your admin) run. The server snapshots it every day, and the admin can restore an earlier snapshot from **Server backups** in the user menu. A restore affects everyone on the server, so ask your admin if you need something brought back.
 
 ---
 

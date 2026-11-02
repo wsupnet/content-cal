@@ -47,6 +47,7 @@ It's built to be **self-hosted**: one Docker container, one SQLite database file
 | ⏱️ **Auto-publish** | Scheduled videos flip to "Published" automatically once their date passes — in *your* timezone. |
 | 📥 **CSV import & export** | Bring an existing spreadsheet in with a column-mapping wizard and duplicate detection; export anytime. |
 | 🌙 **Dark mode + mobile** | Full responsive layout and a one-click dark theme. |
+| 💾 **Backups & restore** | Daily snapshots of the whole server, safe to copy with your NAS backup; the admin can back up, download, or restore one from the app. |
 | 🔒 **Private & self-hosted** | Runs on your NAS via Docker; all data lives in a single SQLite file you control. |
 
 ## See it
