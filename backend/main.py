@@ -667,7 +667,8 @@ def _print_setup_code_if_needed() -> None:
             return
     print(
         f"[setup] No accounts yet. First-run setup code: {SETUP_CODE}\n"
-        "[setup] Enter it in the setup screen to create the admin account.",
+        "[setup] Enter it in the setup screen to create the admin account.\n"
+        "[setup] Expected existing data? Stop and check the data folder (CONTENTCAL_DATA) first.",
         flush=True,  # Docker block-buffers stdout; the code must reach the log now.
     )
 

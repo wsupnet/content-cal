@@ -1,6 +1,6 @@
 # 🛠️ ContentCal — Developer Guide
 
-Everything you need to run, understand, and extend ContentCal. The whole app is intentionally small: a single-file FastAPI backend (~1,500 LOC) and a single-file vanilla-JS frontend (~2,500 LOC), with **no build step** on either side.
+Everything you need to run, understand, and extend ContentCal. The whole app is intentionally small: a single-file FastAPI backend (about 2,200 lines) and a single-file vanilla-JS frontend (about 2,900 lines), with **no build step** on either side.
 
 ---
 
@@ -39,7 +39,7 @@ Everything you need to run, understand, and extend ContentCal. The whole app is 
 | Auth | **bcrypt** password hashing, **itsdangerous** signed session cookies |
 | Packaging | One **Docker** image; frontend served by FastAPI's `StaticFiles` |
 
-**Design philosophy:** keep the entire system inspectable and dependency-light so it can run forever on a home NAS. The frontend is served as static files by the same process that serves the API — same origin, no CORS by default, no separate web server.
+**Design philosophy:** keep the entire system inspectable and dependency-light so it stays easy to run and maintain on a home server or NAS. It's sized for a handful of people at a time, so simplicity wins over scaling features: one process, one SQLite file, no external services. The frontend is served as static files by the same process that serves the API — same origin, no CORS by default, no separate web server.
 
 ---
 
@@ -52,32 +52,30 @@ contentcalv3/
 │   ├── Dockerfile         # python:3.12-slim + uvicorn
 │   ├── requirements.txt   # fastapi, uvicorn, pydantic, sqlmodel, bcrypt, itsdangerous
 │   ├── requirements-dev.txt
-│   └── tests/             # ~140 pytest regression tests
+│   └── tests/             # 150+ pytest regression tests
 ├── frontend/
 │   └── index.html         # The entire frontend (HTML + CSS + JS)
-├── docker-compose.yml     # Maps :8765 -> :8000, mounts $APPDATA/contentcal at /app/data
-├── .env.example           # Template for .env (APPDATA); .env itself is gitignored
+├── docker-compose.yml     # Maps :8765 -> :8000, mounts $CONTENTCAL_DATA (default ./data) at /app/data
+├── .env.example           # Optional settings template; .env itself is gitignored
 ├── Makefile               # setup / test / install-hooks
 └── README.md
 ```
 
-> Data files (`calendar.db`, `.session_secret`, the `backups/` snapshot folder, the migrated legacy `calendar.json`) live in `$APPDATA/contentcal` (mounted at `/app/data`) at runtime, **outside** the repo. On the NAS that is `/volume1/docker/appdata/contentcal`; on a Mac, `./dev-data/contentcal` (gitignored).
+> Data files (`calendar.db`, `.session_secret`, the `backups/` snapshot folder, the migrated legacy `calendar.json`) live in `$CONTENTCAL_DATA` (mounted at `/app/data`) at runtime. It defaults to `./data` (gitignored); long-term installs usually point it outside the repo.
 
 ---
 
 ## 3. Running it
 
-### Docker (production / NAS)
+### Docker
 
 ```bash
-# $APPDATA/contentcal is mounted at /app/data; APPDATA comes from .env
-cp .env.example .env            # NAS: set APPDATA=/volume1/docker/appdata
-mkdir -p dev-data/contentcal    # NAS: /volume1/docker/appdata/contentcal
+# No .env needed: data goes in ./data unless CONTENTCAL_DATA is set in .env
 docker compose up -d --build
 # App: http://<host>:8765   (host 8765 -> container 8000)
 ```
 
-Deploying an update on the NAS is `git pull` then `docker compose up -d --build` from `/volume1/docker/apps/contentcal`.
+To deploy an update, run `git pull` then `docker compose up -d --build` from the repo folder.
 
 The compose file bind-mounts `./frontend` to `/frontend` (read-only) and `./backend/main.py` to `/app/main.py`, so you can edit `main.py` and restart the container without rebuilding the image.
 
@@ -411,8 +409,8 @@ After `make install-hooks`, every `git push` runs the suite first and blocks on 
 | Env var | Default | Purpose |
 |---|---|---|
 | `DATA_DIR` | `/app/data` | The only data-path setting: holds `calendar.db`, `.session_secret`, and legacy `calendar.json` (imported on first run). Logged on startup. |
-| `APPDATA` (compose only, from `.env`) | _(required)_ | Host folder whose `contentcal/` subfolder is mounted at `/app/data`. `docker compose` errors out if unset. |
-| `REQUIRE_EXISTING_DB` | _(unset)_ | `1` = refuse to start if `$DATA_DIR/calendar.db` is missing instead of creating an empty one. Set in `docker-compose.yml`; comment out for a brand-new install's first run. |
+| `CONTENTCAL_DATA` (compose only, from `.env`) | `./data` | Host folder mounted at `/app/data`. Not named `APPDATA` because Windows sets that variable itself and it would override `.env`. |
+| `REQUIRE_EXISTING_DB` | _(unset)_ | `1` = refuse to start if `$DATA_DIR/calendar.db` is missing instead of creating an empty one. Off by default so new installs start cleanly; set it in `.env` for an established install. |
 | `SESSION_SECRET` | on-disk generated | Signs cookies; changing it signs everyone out |
 | `SETUP_CODE` | random per start | Fixed first-run setup code (optional) |
 | `ALLOWED_ORIGINS` | _(none)_ | Comma-separated CORS origins; never `*` (cookies need credentialed CORS) |

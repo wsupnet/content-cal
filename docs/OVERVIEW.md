@@ -4,7 +4,7 @@
 
 ### A self-hosted content calendar for multi-channel YouTube creators
 
-Plan, track, and ship videos across up to six channels — from raw idea to published — in one fast, private dashboard you run on your own NAS.
+Plan, track, and ship videos across up to six channels — from raw idea to published — in one fast, private dashboard you run on your own machine or NAS.
 
 `FastAPI` · `SQLite` · `Vanilla JS` · `Docker` · No build step · No SaaS · Your data stays home
 
@@ -26,7 +26,7 @@ A 90-second tour with captions: signing in, the goal tracker and pipeline stats,
 
 ContentCal is a lightweight, single-container web app for creators who juggle several YouTube channels at once. Every video moves through a clear pipeline — **Idea → Filming → Editing → Ready → Scheduled → Published** — and you can see your whole slate as a calendar, a board, a list, or a year-at-a-glance roll-up. It's multi-user and multi-workspace, so a small team can collaborate, comment, and hand work off.
 
-It's built to be **self-hosted**: one Docker container, one SQLite database file, backed up by your normal NAS routine. No external services, no telemetry, no subscription.
+It's built to be **self-hosted**: one Docker container, one SQLite database file, backed up by your normal backup routine. No external services, no telemetry, no subscription.
 
 ## Why you'd use it
 
@@ -34,6 +34,12 @@ It's built to be **self-hosted**: one Docker container, one SQLite database file
 - **You want to own your data** instead of renting another SaaS dashboard.
 - **You work with an editor or VA** and need comments, an activity trail, and shared visibility — without giving anyone your YouTube login.
 - **You think in goals** ("one video per week per channel") and want a progress bar that tracks reality against the plan.
+
+## Is it a good fit?
+
+ContentCal is made for solo creators and small crews, like you plus an editor, a VA or a few collaborators, self-hosting on a home server, NAS or desktop. It runs as one container with one database file, which is what keeps it easy to install, back up and look after.
+
+That same simplicity means it isn't built for running across several servers or for high-availability setups. If you need those, a hosted tool will suit you better.
 
 ## Highlights
 
@@ -47,8 +53,8 @@ It's built to be **self-hosted**: one Docker container, one SQLite database file
 | ⏱️ **Auto-publish** | Scheduled videos flip to "Published" automatically once their date passes — in *your* timezone. |
 | 📥 **CSV import & export** | Bring an existing spreadsheet in with a column-mapping wizard and duplicate detection; export anytime. |
 | 🌙 **Dark mode + mobile** | Full responsive layout and a one-click dark theme. |
-| 💾 **Backups & restore** | Daily snapshots of the whole server, safe to copy with your NAS backup; the admin can back up, download, or restore one from the app. |
-| 🔒 **Private & self-hosted** | Runs on your NAS via Docker; all data lives in a single SQLite file you control. |
+| 💾 **Backups & restore** | Daily snapshots of the whole server, safe to copy with your own backup tool; the admin can back up, download, or restore one from the app. |
+| 🔒 **Private & self-hosted** | Runs on your own machine or NAS via Docker; all data lives in a single SQLite file you control. |
 
 ## See it
 
@@ -62,28 +68,27 @@ It's built to be **self-hosted**: one Docker container, one SQLite database file
 
 ## Quick start
 
-```bash
-# 1. Point APPDATA at your data root (.env is never committed) and create
-#    the data folder (mounted at /app/data; put calendar.db here if you're
-#    moving an existing install)
-echo "APPDATA=/volume1/docker/appdata" > .env
-mkdir -p /volume1/docker/appdata/contentcal
+Works on anything with Docker: Docker Desktop on Windows or Mac, Docker on Linux, or a NAS.
 
-# 2. Build and run
+```bash
+# 1. In the repo folder, build and run. Your data goes in ./data
 docker compose up -d --build
 
+# 2. Get the setup code from the log
+docker logs contentcal
+
 # 3. Open the app and create your admin account
-#    http://<your-nas-ip>:8765
+#    http://localhost:8765
 ```
 
 The first person to open the app runs a one-time setup wizard that creates the admin account and the first workspace. It asks for a setup code printed in the server logs, so only whoever runs the server can claim it. From there, invite teammates or spin up more workspaces.
 
 ## Tech at a glance
 
-- **Backend** — Python 3.12, FastAPI, SQLModel over SQLite. ~1,500 lines, one file.
+- **Backend** — Python 3.12, FastAPI, SQLModel over SQLite. About 2,200 lines, one file.
 - **Frontend** — A single `index.html` with vanilla JavaScript. No framework, no bundler, no `node_modules`.
 - **Auth** — bcrypt password hashing, signed (itsdangerous) session cookies, 30-day sessions, login throttling, invite-only sign-up.
-- **Tests** — ~140 pytest regression tests covering auth, workspace isolation, roles, invites, concurrency, and cascade deletes. A pre-push git hook runs them before every push.
+- **Tests** — 150+ pytest regression tests covering auth, workspace isolation, roles, invites, concurrency, and cascade deletes. A pre-push git hook runs them before every push.
 - **Deploy** — One Docker container behind whatever reverse proxy / Tailscale setup you already have.
 
 ## Documentation

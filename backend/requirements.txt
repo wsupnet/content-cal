@@ -1,10 +1,12 @@
 fastapi==0.143.1
 starlette==1.8.0
-uvicorn[standard]==0.54.0
+# Plain uvicorn: the [standard] extras (uvloop, httptools, websockets,
+# watchfiles, PyYAML, python-dotenv) only matter for heavy traffic or features
+# ContentCal doesn't use.
+uvicorn==0.54.0
 pydantic==2.14.1
 sqlmodel==0.0.48
 bcrypt==4.2.0
 itsdangerous==2.2.0
 # Transitive, pinned at versions with security fixes.
 anyio==4.15.1
-python-dotenv==1.2.4

@@ -4,8 +4,9 @@ WORKDIR /app
 # Print log lines (including the first-run setup code) immediately.
 ENV PYTHONUNBUFFERED=1
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip==26.2.1 \
- && pip install --no-cache-dir -r requirements.txt
+# Uses the pip that ships with the base image; upgrading it first only added a
+# download to every full rebuild.
+RUN pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
 
 # `make test` runs the suite in this stage so every OS tests on the same Python
 # the app ships with. The source and frontend are mounted at run time.

@@ -5,9 +5,9 @@ services:
     build: ./backend
     container_name: contentcal
     restart: unless-stopped
-    # Run as your own account instead of root (recommended). Use the output of
-    # `id -u` and `id -g`, and first give that account the data folder:
-    #   sudo chown -R 1000:1000 "$APPDATA/contentcal"
+    # Linux and NAS: run as your own account instead of root (recommended). Use
+    # the output of `id -u` and `id -g`, and first give that account the data
+    # folder, for example: sudo chown -R 1000:1000 ./data
     # Left commented so existing installs (whose files root owns) keep working.
     # user: "1000:1000"
     ports:
@@ -15,14 +15,15 @@ services:
     volumes:
       - ./frontend:/frontend:ro          # Serves the HTML frontend
       - ./backend/main.py:/app/main.py:ro # to prevent the need to rebuild the container
-      # App data lives OUTSIDE the repo. APPDATA comes from .env (not in Git);
-      # see .env.example. calendar.db and .session_secret live in this folder.
-      - ${APPDATA:?APPDATA is not set}/contentcal:/app/data
+      # Your calendar.db, .session_secret and backups live in this folder. It is
+      # ./data unless you set CONTENTCAL_DATA in .env (see .env.example).
+      - ${CONTENTCAL_DATA:-./data}:/app/data
     environment:
       - DATA_DIR=/app/data
-      # Refuse to start if $APPDATA/contentcal/calendar.db is missing instead of
-      # creating an empty one. Comment out for a brand-new install's very first run.
-      - REQUIRE_EXISTING_DB=1
+      # Optional safety check for an established install: set
+      # REQUIRE_EXISTING_DB=1 in .env to refuse to start if calendar.db is missing
+      # (a wrong path or an unmounted drive) instead of creating an empty one.
+      - REQUIRE_EXISTING_DB=${REQUIRE_EXISTING_DB:-}
       # Behind a reverse proxy (Caddy, nginx, Traefik…)? Without this, uvicorn
       # sees every user as the proxy's IP, so all users share one rate-limit
       # bucket. Trust ONLY the proxy, and only when every request goes through
@@ -37,7 +38,7 @@ services:
       # Largest body for channel saves / CSV import chunks (default 2.5 MB).
       # Other requests are capped lower in code (256 KB; 16 KB when logged out).
       # - MAX_REQUEST_BYTES=2621440
-      # Database snapshots kept in $APPDATA/contentcal/backups (one at each
+      # Database snapshots kept in the data folder's backups/ (one at each
       # start, then one a day). Back up that folder, not calendar.db. 0 = off.
       # - BACKUP_KEEP=14
       # Serving over HTTPS (reverse proxy, Tailscale Serve)? Mark the login

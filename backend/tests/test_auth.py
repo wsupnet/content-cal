@@ -1,3 +1,5 @@
+import pathlib
+
 import main
 from conftest import do_setup, do_signup, do_login, me, DEFAULT_PW
 
@@ -93,3 +95,17 @@ def test_session_persists_across_requests(client):
     do_setup(client, "alice")
     for _ in range(3):
         assert client.get("/api/me").status_code == 200
+
+
+def test_setup_log_warns_when_existing_data_was_expected(client, capsys):
+    main._print_setup_code_if_needed()
+    out = capsys.readouterr().out
+    assert main.SETUP_CODE in out
+    assert "CONTENTCAL_DATA" in out
+
+
+def test_setup_screen_warns_when_existing_data_was_expected():
+    # The test client serves a stub page, so read the real frontend file.
+    html = (pathlib.Path(__file__).resolve().parents[2] / "frontend" / "index.html").read_text()
+    assert "No existing accounts found." in html
+    assert "CONTENTCAL_DATA" in html

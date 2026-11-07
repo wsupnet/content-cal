@@ -4,8 +4,10 @@ A lightweight, self-hosted Docker app for planning and tracking video content
 across multiple YouTube channels. Multi-user and multi-workspace, with a
 six-stage pipeline (Idea → Filming → Editing → Ready → Scheduled → Published),
 calendar / board / list / year views, goals, comments, and an activity feed.
+It's made for solo creators and small crews self-hosting at home, and it stays
+simple on purpose: one container, one database file.
 
-Data is stored in a single **SQLite** database file (`calendar.db`) on your NAS.
+Data is stored in a single **SQLite** database file (`calendar.db`) on your own machine.
 (Older installs that used a `calendar.json` file are imported automatically on
 first start and renamed to `calendar.json.migrated`.)
 
@@ -35,45 +37,28 @@ first start and renamed to `calendar.json.migrated`.)
 
 ## Quick Start
 
-### 1. Data folder
+ContentCal runs on anything with Docker: Docker Desktop on Windows or Mac,
+Docker on Linux, or a NAS with Docker support. These commands are the same on
+all of them.
 
-Your data lives **outside the repo**, in `$APPDATA/contentcal` (mounted at
-`/app/data`). `APPDATA` is set in a `.env` file next to `docker-compose.yml`
-that is never committed; `docker compose` refuses to run if it is missing.
+### 1. Get the code and start it
 
-On the NAS (repo at `/volume1/docker/apps/contentcal`):
-
-```bash
-cd /volume1/docker/apps/contentcal
-echo "APPDATA=/volume1/docker/appdata" > .env
-mkdir -p /volume1/docker/appdata/contentcal
-```
-
-On a Mac for local testing, copy the example, which points at the gitignored
-`./dev-data` folder:
-
-```bash
-cp .env.example .env
-mkdir -p dev-data/contentcal
-```
-
-Moving an existing install? Copy your `calendar.db` and `.session_secret` into
-`$APPDATA/contentcal` **before** the first start. The compose file sets
-`REQUIRE_EXISTING_DB=1`, so the app refuses to start rather than create an
-empty database. For a brand-new install, comment that line out for the first
-run only.
-
-### 2. Build and run
+Clone or download this repo, open a terminal in its folder, then run:
 
 ```bash
 docker compose up -d --build
 ```
 
-### 3. Open the app
+You don't need to create any files first. Your data goes in a `data` folder
+next to `docker-compose.yml`. To keep it somewhere else, see
+[Choosing the data folder](#choosing-the-data-folder).
 
-Navigate to: `http://<your-nas-ip>:8765`
+### 2. Open the app
 
-Via Tailscale: `http://<nas-tailscale-ip>:8765`
+- On the same machine: `http://localhost:8765`
+- From another device: `http://<server-ip>:8765`
+
+### 3. Create your admin account
 
 The **first** person to open the app runs a one-time setup wizard that creates
 the admin account and the first workspace. The wizard asks for a **setup
@@ -81,13 +66,14 @@ code**, which the server prints to its log on startup so a stranger can't claim
 your install first:
 
 ```bash
-docker logs contentcal 2>&1 | grep "setup code"
+docker logs contentcal
 ```
 
-(In Dockhand, open the container's logs.) The code changes on every restart
-until setup is done. After that, sign in with your account; invite teammates
-from **Workspace settings**. Sign-up is **invite-only**: people join through an
-invite link (set `ALLOW_OPEN_SIGNUP=1` in `docker-compose.yml` to open it).
+Look for the line with `First-run setup code`. (In a container manager, open
+the container's logs.) The code changes on every restart until setup is done.
+After that, sign in with your account; invite teammates from **Workspace
+settings**. Sign-up is **invite-only**: people join through an invite link (set
+`ALLOW_OPEN_SIGNUP=1` in `docker-compose.yml` to open it).
 
 > ⚠️ Plain `http://` sends logins unencrypted, so use HTTPS (a reverse proxy or
 > Tailscale) when exposing this beyond your home network, and then set
@@ -96,6 +82,59 @@ invite link (set `ALLOW_OPEN_SIGNUP=1` in `docker-compose.yml` to open it).
 >
 > The container runs as root unless you uncomment the `user:` line in
 > `docker-compose.yml` (instructions are next to it).
+
+### Choosing the data folder
+
+To keep your data somewhere other than `./data`, create a file named `.env` next
+to `docker-compose.yml` with one of these lines (`.env.example` has the same
+examples):
+
+```bash
+# Linux
+CONTENTCAL_DATA=/srv/contentcal
+# NAS
+CONTENTCAL_DATA=/volume1/docker/appdata/contentcal
+# Windows (use forward slashes)
+CONTENTCAL_DATA=C:/ContentCal/data
+```
+
+`data/` is ignored by Git, so `git pull` won't touch it, but deleting the app's
+folder deletes it too. For a long-term install, a folder outside the repo is
+safer.
+
+### Moving an existing install
+
+Stop the app, then copy your `calendar.db` and `.session_secret` into the new
+data folder **before** starting it. If you see the setup screen afterwards, the
+app isn't looking in the right folder: stop and check `CONTENTCAL_DATA`. Your
+data hasn't been touched.
+
+Once an install holds real data, you can also add `REQUIRE_EXISTING_DB=1` to
+`.env`. The app then refuses to start if `calendar.db` is missing, instead of
+creating an empty one. That's most useful when the folder is on a drive that
+might not be mounted.
+
+### Upgrading from a version that used `APPDATA`
+
+`APPDATA` was replaced because Windows already has a variable with that name,
+which overrode the one in `.env`. **Before you update**, change your `.env`.
+`CONTENTCAL_DATA` is the folder holding `calendar.db`, so it now includes the
+`contentcal` part. For example, this:
+
+```bash
+APPDATA=/volume1/docker/appdata
+```
+
+becomes:
+
+```bash
+CONTENTCAL_DATA=/volume1/docker/appdata/contentcal
+REQUIRE_EXISTING_DB=1
+```
+
+If you set `APPDATA` as a stack variable in a container manager, change it there
+too. `docker-compose.yml` no longer requires `REQUIRE_EXISTING_DB`, so add it
+yourself if you want to keep that protection.
 
 ---
 
@@ -106,8 +145,8 @@ commented out, with notes):
 
 | Variable | Default | What it does |
 |---|---|---|
-| `APPDATA` (in `.env`) | _(required)_ | Host folder holding `contentcal/calendar.db` |
-| `REQUIRE_EXISTING_DB` | `1` in compose | Refuse to start without an existing database |
+| `CONTENTCAL_DATA` (in `.env`) | `./data` | Folder holding `calendar.db`, `.session_secret` and `backups/` |
+| `REQUIRE_EXISTING_DB` (in `.env`) | off | `1` refuses to start without an existing database |
 | `ALLOW_OPEN_SIGNUP` | off | `1` lets anyone create an account; otherwise invite-only |
 | `COOKIE_SECURE` | off | `1` when served over HTTPS: HTTPS-only cookie + HSTS |
 | `FORWARDED_ALLOW_IPS` | `127.0.0.1` | Your reverse proxy's IP/subnet, so each user gets their own rate limits. Only set it when **every** request goes through the proxy (see the compose file) |
@@ -125,7 +164,7 @@ commented out, with notes):
   memory, so run a single container with a single uvicorn process. Multiple
   workers or replicas aren't supported.
 - **Give each app its own hostname** when exposing it. Browsers share cookies
-  between every port on the same host, so other web apps on your NAS's IP
+  between every port on the same host, so other web apps on your server's IP
   receive ContentCal's login cookie too. Serving ContentCal on its own name
   (e.g. `calendar.example.com` through a reverse proxy, with
   `COOKIE_SECURE=1`) is the only way to keep it to itself. The cookie name is
@@ -144,57 +183,48 @@ commented out, with notes):
 
 ---
 
-## Dockhand Setup
+## NAS and Container Managers
 
-The stack is deployed from the repo with `docker compose`, so Dockhand only
-needs to manage the existing compose project:
+ContentCal's `docker-compose.yml` mounts `./frontend` and `./backend/main.py`
+relative to its own folder, so it needs the whole repo on the machine. Pasting
+the compose file into a container manager on its own won't work.
 
-1. Clone the repo to `/volume1/docker/apps/contentcal` and create its `.env`
-   (see [Data folder](#1-data-folder))
-2. In Dockhand, add the stack from that folder's `docker-compose.yml` (the
-   project name is `contentcal`)
-3. Make sure `APPDATA=/volume1/docker/appdata` is set, either from the `.env`
-   next to the compose file or as a stack environment variable in Dockhand
-4. Deploy
-
-Point Dockhand at the compose file inside the repo rather than pasting its
-contents: the `./frontend` and `./backend/main.py` mounts are relative to the
-compose file's folder and won't resolve from a pasted copy.
+1. Put the repo in a folder on your server, for example
+   `/volume1/docker/apps/contentcal`
+2. Set `CONTENTCAL_DATA` to a folder for your data, either in a `.env` next to
+   `docker-compose.yml` or as a stack variable in your container manager
+3. In your container manager (Dockhand, for example), add the stack from that
+   folder's `docker-compose.yml`. The project name is `contentcal`
+4. Deploy, then get the setup code from the container's logs
 
 ---
 
 ## Updating
 
-On the NAS:
+From the app's folder:
 
 ```bash
-cd /volume1/docker/apps/contentcal
 git pull
 docker compose up -d --build
 ```
 
-Your data in `$APPDATA/contentcal` is untouched by `git pull`.
+Your data folder is untouched by `git pull`.
 
 ---
 
 ## Data Backup
 
 Your entire calendar — every workspace, channel, video, comment, and account —
-lives in one SQLite file:
-```
-/volume1/docker/appdata/contentcal/calendar.db
-```
+lives in one SQLite file in your data folder: `calendar.db`.
 
 Don't back up `calendar.db` itself: a copy taken while someone is saving can
 be corrupt. Instead, the app writes a consistent snapshot to the `backups`
 folder next to it when it starts and once a day after that, and keeps the 14
-newest (`BACKUP_KEEP` changes how many):
-```
-/volume1/docker/appdata/contentcal/backups/calendar-20261102T031500Z.db
-```
+newest (`BACKUP_KEEP` changes how many), named like
+`backups/calendar-20261102T031500Z.db`.
 
-Point your normal NAS backup routine (rsync, Hyper Backup, etc.) at that
-`backups` folder. A snapshot only appears once it's fully written, so it's
+Point your normal backup tool (File History, Time Machine, rsync, Hyper Backup,
+etc.) at that `backups` folder. A snapshot only appears once it's fully written, so it's
 safe to copy at any time. Also back up the `.session_secret` file in the data
 folder; restoring it keeps users logged in.
 
@@ -204,9 +234,9 @@ Sign in with the admin account (the one created at first-run setup) and open
 **Server backups** from the user menu. From there you can:
 
 - **Back up now** — take a snapshot on demand, e.g. before a big CSV import.
-- **Download** a snapshot to keep a copy off the NAS.
+- **Download** a snapshot to keep a copy off the server.
 - **Restore** any snapshot in the list, or **Restore from file** to upload one
-  you downloaded earlier or pulled from your NAS backup.
+  you downloaded earlier or pulled from your own backup.
 
 A restore replaces everything on the server (every workspace, account, video
 and comment) and signs everyone out, so people sign in again with their
@@ -224,6 +254,8 @@ cp backups/calendar-20261102T031500Z.db calendar.db   # run in the data folder
 rm -f calendar.db-journal
 docker compose start contentcal
 ```
+
+On Windows, do the copy and delete in File Explorer instead.
 
 Snapshots and the session key are readable only by the account the container runs as (root by
 default) because they hold password hashes and the session key. Run backups as

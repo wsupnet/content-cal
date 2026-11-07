@@ -874,6 +874,7 @@ function showAuthScreen(view){
     body.innerHTML=`
       <div class="auth-title">Welcome to ContentCal</div>
       <div class="auth-sub">Let's create your admin account. Any existing data will be moved into your new workspace.</div>
+      <div role="note" style="margin-bottom:var(--space-4);padding:var(--space-3);border:1px solid var(--color-border);border-radius:var(--radius-md);font-size:var(--text-xs);color:var(--color-text-muted)"><strong style="color:var(--color-text)">No existing accounts found.</strong> That's expected on a new install. If you were expecting your existing calendar, stop here, check your data folder setting (<code>CONTENTCAL_DATA</code>) and restart the app.</div>
       ${errBlock}
       <form class="auth-form" onsubmit="submitSetup(event)">
         <div class="form-group"><label class="form-label" for="setup-username">Username</label><input class="form-input" id="setup-username" type="text" autocomplete="username" required minlength="2" maxlength="80" pattern="[A-Za-z0-9_.\\-]+" title="Letters, numbers, _ . or -"></div>
